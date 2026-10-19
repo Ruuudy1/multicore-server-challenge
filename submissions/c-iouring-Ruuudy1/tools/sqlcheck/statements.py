@@ -82,32 +82,65 @@ HEADER_COLUMNS = ("0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::
                   "NULL::text AS username, NULL::text AS bio, NULL::text AS image")
 
 
-def header_facts(kind, match):
+def header_facts(kind, match, counts="group", tags="hash"):
     # match(column) restricts favorites and article_tags rows to this page's article ids.
+    # counts="raw" (E7): fc.ids lists the article id of every favorite on the page and fc.cnts is NULL; C counts them.
+    # tags="probe" (E8): tag names by primary-key probes instead of a hash join on tags.
+    if counts == "group":
+        fc = (f"SELECT array_agg(g.article_id ORDER BY g.article_id) AS ids, array_agg(g.n ORDER BY g.article_id) AS cnts\n"
+              f"                       FROM (SELECT f.article_id, count(*) AS n FROM favorites f WHERE {match('f.article_id')} GROUP BY f.article_id) g")
+    else:
+        fc = f"SELECT ARRAY(SELECT f.article_id FROM favorites f WHERE {match('f.article_id')}) AS ids, NULL::bigint[] AS cnts"
+    if tags == "hash":
+        tg = ("SELECT array_agg(at.article_id ORDER BY t.name, at.article_id) AS aids, array_agg(t.name ORDER BY t.name, at.article_id) AS names\n"
+              f"                       FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE {match('at.article_id')}")
+    else:
+        tg = ("SELECT array_agg(x.article_id ORDER BY x.name, x.article_id) AS aids, array_agg(x.name ORDER BY x.name, x.article_id) AS names "
+              "FROM (SELECT at.article_id, t.name FROM article_tags at "
+              "CROSS JOIN LATERAL (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id OFFSET 0) t "
+              f"WHERE {match('at.article_id')}) x")
     return f"""SELECT {HEADER_COLUMNS},
        {COUNTS[kind]} AS n, fc.ids, fc.cnts,
        ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND {match('f.article_id')}) AS my_favs,
        {"'{}'::bigint[]" if kind == "feed" else FOLLOWEES} AS my_follows, tg.aids, tg.names
   FROM r
-  LEFT JOIN LATERAL (SELECT array_agg(g.article_id ORDER BY g.article_id) AS ids, array_agg(g.n ORDER BY g.article_id) AS cnts
-                       FROM (SELECT f.article_id, count(*) AS n FROM favorites f WHERE {match('f.article_id')} GROUP BY f.article_id) g) fc ON true
-  LEFT JOIN LATERAL (SELECT array_agg(at.article_id ORDER BY t.name, at.article_id) AS aids, array_agg(t.name ORDER BY t.name, at.article_id) AS names
-                       FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE {match('at.article_id')}) tg ON true"""
+  LEFT JOIN LATERAL ({fc}) fc ON true
+  LEFT JOIN LATERAL ({tg}) tg ON true"""
 
 
-def header_list(kind):
+def header_list(kind, counts="group", tags="hash"):
     # Every existing id between the global page's min and max is on the page, so its ranges are exact; other kinds use = ANY(ids).
     dense = kind == "global"
     ranges = "r AS MATERIALIZED (SELECT min(id) AS lo, max(id) AS hi FROM p)" if dense else "r AS MATERIALIZED (SELECT coalesce(array_agg(id), '{}') AS ids FROM p)"
     return (f"WITH {PREFIXES[kind] + ', ' if kind in PREFIXES else ''}p AS MATERIALIZED (SELECT id FROM ({PAGES[kind]}) b LIMIT $2), {ranges} " +
-            header_facts(kind, (lambda column: f"{column} BETWEEN r.lo AND r.hi") if dense else (lambda column: f"{column} = ANY(r.ids)")) +
+            header_facts(kind, (lambda column: f"{column} BETWEEN r.lo AND r.hi") if dense else (lambda column: f"{column} = ANY(r.ids)"), counts, tags) +
             " UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, "
             "NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] "
             "FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u")
 
 
+def per_row_list_dedup(kind):
+    # E10: v1 with the page materialized and one users look-up per distinct author on it (feed pages repeat authors).
+    following = "true" if kind == "feed" else "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = p.author_id)"
+    return (f"WITH {PREFIXES[kind] + ', ' if kind in PREFIXES else ''}"
+            "p AS MATERIALIZED (SELECT a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at "
+            f"FROM ({PAGES[kind]}) b JOIN articles a ON a.id = b.id ORDER BY a.id DESC LIMIT $2), "
+            "au AS MATERIALIZED (SELECT u.id, u.username, u.bio, u.image FROM (SELECT DISTINCT author_id FROM p) d "
+            "CROSS JOIN LATERAL (SELECT id, username, bio, image FROM users WHERE id = d.author_id OFFSET 0) u) "
+            "SELECT c.n, p.id, p.author_id, p.slug, p.title, p.description, p.created_at, p.updated_at, "
+            "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = p.id ORDER BY 1) AS tag_list, "
+            "(SELECT count(*) FROM favorites f WHERE f.article_id = p.id) AS favorites_count, "
+            "EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = $1 AND f.article_id = p.id) AS favorited, "
+            f"au.username, au.bio, au.image, {following} AS following "
+            f"FROM (SELECT {COUNTS[kind]} AS n) c LEFT JOIN p ON true LEFT JOIN au ON au.id = p.author_id "
+            "ORDER BY p.id DESC")
+
+
 V1 = {kind: per_row_list(kind) for kind in PAGES}
 V2 = {kind: header_list(kind) for kind in PAGES}
+V1D = {kind: per_row_list_dedup(kind) for kind in PAGES}                 # E10
+V2C = {kind: header_list(kind, counts="raw") for kind in PAGES}          # E7
+V2T = {kind: header_list(kind, tags="probe") for kind in PAGES}          # E8
 
 # $2 is the id parsed from the slug's trailing "-<id>"; COLLATE "C" stops the planner from preferring the slug index.
 ARTICLE = """SELECT a.title, a.description, a.body, a.created_at, a.updated_at,
@@ -216,3 +249,34 @@ REFERENCE_USERS = {
 
 # The slug-only article lookup, for a slug whose suffix is not "-<id>" (ref_article in check.py).
 ARTICLE_BY_SLUG = FULL_SELECT + " WHERE a.slug = $2"
+
+# E2: several concurrent point reads in one statement. Each request is one element of the parameter arrays and gets
+# back exactly the rows its own statement would return, tagged with its position (ord, from 1); nothing is shared
+# between requests (the tag list is left out on purpose: batching it would coalesce identical reads).
+BATCH_ROWS = "unnest($1::bigint[], $2::bigint[], $3::text[]) WITH ORDINALITY AS r(viewer, id, slug, ord)"
+BATCHED = {
+    "user_get_b": ("SELECT r.ord, u.username, u.email, u.bio, u.image "
+                   "FROM unnest($1::bigint[]) WITH ORDINALITY AS r(id, ord) JOIN users u ON u.id = r.id"),
+    "profile_b": ("SELECT r.ord, u.username, u.bio, u.image, "
+                  "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = u.id) AS following "
+                  "FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS r(viewer, username, ord) JOIN users u ON u.username = r.username"),
+    "article_b": ("SELECT r.ord, a.title, a.description, a.body, a.created_at, a.updated_at, "
+                  "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list, "
+                  "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, "
+                  "EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = r.viewer AND f.article_id = a.id) AS favorited, "
+                  "u.username, u.bio, u.image, "
+                  "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = a.author_id) AS following "
+                  f"FROM {BATCH_ROWS} JOIN articles a ON a.id = r.id AND a.slug = r.slug COLLATE \"C\" JOIN users u ON u.id = a.author_id"),
+    "comments_b": ("SELECT r.ord, 0 AS k, NULL::bigint AS id, NULL::text AS body, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, "
+                   "NULL::bigint AS author_id, NULL::text AS username, NULL::text AS bio, NULL::text AS image, "
+                   "ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer) AS my_follows "
+                   f"FROM {BATCH_ROWS} JOIN articles a ON a.id = r.id AND a.slug = r.slug COLLATE \"C\" "
+                   "UNION ALL "
+                   "SELECT r.ord, 1, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image, NULL "
+                   f"FROM {BATCH_ROWS} "
+                   "CROSS JOIN LATERAL (SELECT id, body, created_at, updated_at, author_id FROM comments "
+                   "WHERE article_id = r.id ORDER BY created_at DESC, id DESC LIMIT 100) c "
+                   "CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = c.author_id OFFSET 0) u"),
+}
+BATCHED_SIGNATURES = {"user_get_b": "(bigint[])", "profile_b": "(bigint[], text[])", "article_b": "(bigint[], bigint[], text[])",
+                      "comments_b": "(bigint[], bigint[], text[])"}

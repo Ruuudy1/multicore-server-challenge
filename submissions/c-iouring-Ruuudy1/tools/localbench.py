@@ -133,12 +133,17 @@ def main():
     ap.add_argument("--loadgen", default=os.path.expanduser("~/loadgen"))
     ap.add_argument("--template", default="conduit_seed")
     ap.add_argument("--keep-db", action="store_true")
+    ap.add_argument("--db", help="use this existing database (no copy, kept afterwards): an aged database for A/B work")
     ap.add_argument("--pgss", action="store_true", help="profile statements with pg_stat_statements (must be preloaded)")
     ap.add_argument("--label", default="")
     args = ap.parse_args()
 
-    db = f"bench_{os.getpid()}"
-    psql(f"CREATE DATABASE {db} TEMPLATE {args.template} STRATEGY FILE_COPY")
+    if args.db:
+        db = args.db
+        args.keep_db = True
+    else:
+        db = f"bench_{os.getpid()}"
+        psql(f"CREATE DATABASE {db} TEMPLATE {args.template} STRATEGY FILE_COPY")
     if args.pgss:
         psql("CREATE EXTENSION IF NOT EXISTS pg_stat_statements", db)
     env = dict(os.environ, DATABASE_URL=f"postgres://conduit:conduit@127.0.0.1:5432/{db}", JWT_SECRET=SECRET,
@@ -161,11 +166,11 @@ def main():
         sampler = Sampler(srv.pid)
         sampler.start()
         if args.warmup:
-            loadgen(args, max(args.users // 2, 1), 10, args.warmup, f"warm{os.getpid()}", f"/tmp/{db}-warm.json", args.think)
+            loadgen(args, max(args.users // 2, 1), 10, args.warmup, f"warm{os.getpid()}t{int(time.time())}", f"/tmp/{db}-warm.json", args.think)
         out = f"/tmp/{db}.json"
         if args.pgss:
             psql("SELECT pg_stat_statements_reset()", db)
-        start = loadgen(args, args.users, args.ramp, args.measure, f"run{os.getpid()}", out, args.think)
+        start = loadgen(args, args.users, args.ramp, args.measure, f"run{os.getpid()}t{int(time.time())}", out, args.think)
         sampler.stop = True
         if args.pgss:
             q = ("SELECT calls, round(total_exec_time::numeric, 0) AS total_ms, round(mean_exec_time::numeric * 1000, 1) AS mean_us, "

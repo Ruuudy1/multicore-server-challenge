@@ -61,7 +61,7 @@ void db_write(struct req *r, int stmt, int nparams, pg_done_fn done, bool alone)
 
 /* ---------- connections ---------- */
 
-static char stmt_names[S_COUNT][8];
+static char stmt_names[S_COUNT][16];
 
 static void pgc_alloc(struct pgc *c) {
     c->scap = 64 * 1024;
@@ -165,6 +165,59 @@ static void enc_job(struct pgc *c, struct req *r) {
     c->slen += (uint32_t)(p - start);
 }
 
+/* E2: one execution of the batched form of the leader's statement; parameter i becomes the array of every member's
+ * parameter i (the element types are the single statement's). */
+static int batched_of(int s) {
+    switch (s) {
+    case S_A_GET: return S_A_GET_B;
+    case S_C_LIST: return S_C_LIST_B;
+    case S_P_GET: return S_P_GET_B;
+    case S_U_GET: return S_U_GET_B;
+    default: return -1;
+    }
+}
+
+static void enc_group(struct pgc *c, struct req *leader) {
+    const struct stmt *st = &STMTS[leader->stmt];
+    const char *name = stmt_names[batched_of(leader->stmt)];
+    uint32_t nl = (uint32_t)strlen(name) + 1, need = 1 + 4 + 1 + nl + 8 + 2 + 4 + 10;
+    for (int i = 0; i < st->nparams; i++) {
+        need += 4 + 20;
+        for (struct req *m = leader; m; m = m->gnext) need += 4 + (m->prm[i].len > 0 ? (uint32_t)m->prm[i].len : 0);
+    }
+    sb_need(c, need);
+    char *p = c->sbuf + c->slen, *start = p;
+    *p++ = 'B';
+    char *lenp = p;
+    p += 4;
+    *p++ = 0;
+    memcpy(p, name, nl); p += nl;
+    wr16(p, 1); wr16(p + 2, 1); p += 4;
+    wr16(p, st->nparams); p += 2;
+    for (int i = 0; i < st->nparams; i++) {
+        char *plen = p;
+        p += 4;
+        bool nulls = false;
+        for (struct req *m = leader; m; m = m->gnext) if (m->prm[i].len < 0) nulls = true;
+        wr32(p, 1); wr32(p + 4, nulls); wr32(p + 8, st->ptypes[i]); wr32(p + 12, leader->gsize); wr32(p + 16, 1);
+        p += 20;
+        for (struct req *m = leader; m; m = m->gnext) {
+            int32_t len = m->prm[i].len;
+            wr32(p, (uint32_t)len);
+            p += 4;
+            if (len > 0) { memcpy(p, m->prm[i].p, (size_t)len); p += len; }
+        }
+        wr32(plen, (uint32_t)(p - plen - 4));
+    }
+    wr16(p, 1); wr16(p + 2, 1); p += 4;
+    wr32(lenp, (uint32_t)(p - lenp));
+    *p++ = 'E';
+    wr32(p, 9); p += 4;
+    *p++ = 0;
+    wr32(p, 0); p += 4;
+    c->slen += (uint32_t)(p - start);
+}
+
 static void enc_sync(struct pgc *c) {
     sb_need(c, 5);
     char *p = c->sbuf + c->slen;
@@ -185,25 +238,66 @@ static void jobs_append(struct pgc *c, struct req *r) {
     c->njobs++;
 }
 
+/* E2: links the requests of one batchable statement in take[] behind the first of them (at most 255 per group). */
+static void group_reads(struct req **take, int nt) {
+    static const int singles[] = {S_A_GET, S_C_LIST, S_P_GET, S_U_GET};
+    for (size_t s = 0; s < ARRAY_LEN(singles); s++) {
+        int count = 0;
+        for (int i = 0; i < nt; i++) if (take[i] && take[i]->stmt == singles[s]) count++;
+        if (count < cfg.e2_min) continue;
+        struct req *leader = NULL, *last = NULL;
+        for (int i = 0; i < nt; i++) {
+            struct req *r = take[i];
+            if (!r || r->stmt != singles[s]) continue;
+            r->gnext = NULL;
+            if (!leader || leader->gsize == 255) {
+                leader = last = r;
+                r->flags |= RQ_GROUP;
+                r->gsize = 1;
+                continue;
+            }
+            last->gnext = r;
+            last = r;
+            leader->gsize++;
+            take[i] = NULL; /* answered through its leader */
+        }
+    }
+    /* a group of one is a plain execution */
+    for (int i = 0; i < nt; i++) if (take[i] && (take[i]->flags & RQ_GROUP) && take[i]->gsize == 1) take[i]->flags &= (uint16_t)~RQ_GROUP;
+}
+
 static void send_reads(struct loop *l, struct pgc *c) {
     struct batch *b = &c->batches[(c->bhead + c->bcount) % MAX_DEPTH];
     b->n = b->done = 0;
     b->err = false;
-    while (b->n < cfg.read_batch && l->rq_head) {
+    struct req *take[1024];
+    int nt = 0;
+    while (nt < cfg.read_batch && l->rq_head) {
         struct req *r = q_pop(&l->rq_head, &l->rq_tail);
         l->rq_len--;
         if (r->flags & RQ_ORPHAN) { req_free(r); continue; } /* the client left before we asked */
-        enc_job(c, r);
+        take[nt++] = r;
+    }
+    if (!nt) return;
+    if (cfg.e2_batch) group_reads(take, nt);
+    for (int i = 0; i < nt; i++) {
+        struct req *r = take[i];
+        if (!r) continue;
+        if (r->flags & RQ_GROUP) {
+            enc_group(c, r);
+            l->st.grouped += r->gsize;
+        } else {
+            enc_job(c, r);
+        }
         jobs_append(c, r);
         b->n++;
     }
-    if (!b->n) return;
     enc_sync(c);
     c->bcount++;
     c->batches_sent++;
-    c->jobs_sent += b->n;
+    c->jobs_sent += (uint64_t)nt;
     l->st.pg_batches++;
-    l->st.pg_jobs += b->n;
+    l->st.pg_jobs += (uint64_t)nt;
     pgc_send(l, c);
 }
 
@@ -283,6 +377,64 @@ static void commit_append(struct pgc *c, struct req *r) {
 
 static bool retryable(const char *s) { return !strcmp(s, "40P01") || !strcmp(s, "40001"); }
 
+/* E2: answers every request of a grouped execution with a view of only its own rows (ord = its position), minus
+ * the ord column, so its usual renderer sees exactly what its own statement would have returned. */
+static void dispatch_group(struct pgc *c, struct req *leader, const struct pgres *res, const char *sqlstate) {
+    uint16_t nc = STMTS[leader->stmt].ncols;
+    if (!sqlstate && res->nrows && res->ncols != nc + 1) sqlstate = "XX000";
+    uint32_t need = res->nrows * nc + 1;
+    if (need > c->gvals_cap) {
+        c->gvals_cap = need * 2;
+        c->gvals = realloc(c->gvals, sizeof(struct pgval) * c->gvals_cap);
+        if (!c->gvals) die("out of memory");
+    }
+    int64_t k = 1;
+    for (struct req *m = leader, *next; m; m = next, k++) {
+        next = m->gnext;
+        m->gnext = NULL;
+        m->flags &= (uint16_t)~RQ_GROUP;
+        if (m->flags & RQ_ORPHAN) { req_free(m); continue; }
+        if (sqlstate) {
+            log_msg("statement %s failed: %s", STMTS[batched_of(m->stmt)].name, sqlstate);
+            resp_error(m, 500, "internal error");
+        } else {
+            uint32_t rows = 0;
+            for (uint32_t i = 0; i < res->nrows; i++) {
+                if (pv_i64(res, i, 0) != k) continue;
+                memcpy(&c->gvals[rows * nc], &res->v[i * res->ncols + 1], sizeof(struct pgval) * nc);
+                rows++;
+            }
+            struct pgres mine = {.base = res->base, .v = c->gvals, .bytes = res->bytes, .nrows = rows, .ncols = nc};
+            mine.sqlstate[0] = 0;
+            m->done(m, &mine);
+        }
+        if (m->flags & RQ_READY) req_complete(m);
+    }
+}
+
+/* Puts reads back at the head of the FIFO in order, unpacking E2 groups into their requests. */
+static void requeue_reads(struct loop *l, struct req *first) {
+    struct req *head = NULL, *tail = NULL;
+    uint32_t n = 0;
+    for (struct req *r = first, *next; r; r = next) {
+        next = r->next;
+        bool group = r->flags & RQ_GROUP;
+        r->flags &= (uint16_t)~RQ_GROUP;
+        for (struct req *g = r, *gn; g; g = gn) {
+            gn = group ? g->gnext : NULL;
+            g->gnext = g->next = NULL;
+            if (tail) tail->next = g;
+            else head = g;
+            tail = g;
+            n++;
+        }
+    }
+    if (head) {
+        q_prepend(&l->rq_head, &l->rq_tail, head, tail);
+        l->rq_len += n;
+    }
+}
+
 /* A statement finished (CommandComplete, or ErrorResponse when sqlstate is set). */
 static void job_done(struct loop *l, struct pgc *c, const char *sqlstate) {
     struct batch *b = &c->batches[c->bhead];
@@ -300,7 +452,10 @@ static void job_done(struct loop *l, struct pgc *c, const char *sqlstate) {
     b->done++;
     struct pgres res;
     res_view(c, r, &res, sqlstate);
-    if (!c->writer) {
+    if (!c->writer && (r->flags & RQ_GROUP)) {
+        if (sqlstate) b->err = true;
+        dispatch_group(c, r, &res, sqlstate);
+    } else if (!c->writer) {
         if (sqlstate) b->err = true;
         if (r->flags & RQ_ORPHAN) req_free(r);
         else {
@@ -352,12 +507,7 @@ static void batch_done(struct loop *l, struct pgc *c) {
         last = r;
     }
     if (!c->writer) {
-        if (first) { /* skipped after a failed statement: ask again first */
-            uint32_t n = 0;
-            for (struct req *r = first; r; r = r->next) n++;
-            q_prepend(&l->rq_head, &l->rq_tail, first, last);
-            l->rq_len += n;
-        }
+        requeue_reads(l, first); /* skipped after a failed statement: ask again first */
     } else {
         struct req *g = c->chead, *gl = c->ctail;
         c->chead = c->ctail = NULL;
@@ -368,6 +518,7 @@ static void batch_done(struct loop *l, struct pgc *c) {
             req_complete(g); /* the write's own error response */
         } else {
             /* the group rolled back: retry every write alone, in order */
+            if (b->n > 1) log_msg("write group of %u rolled back: retrying each write alone", b->n);
             if (gl) { gl->next = first; if (!first) last = gl; first = g; }
             uint32_t n = 0;
             for (struct req *r = first; r; r = r->next) {
@@ -477,12 +628,7 @@ static void pgc_fail(struct loop *l, struct pgc *c, const char *why) {
     c->fd = -1;
     c->gen++;
     if (!c->writer) {
-        /* reads are safe to ask again */
-        if (c->jhead) {
-            uint32_t n = c->njobs;
-            q_prepend(&l->rq_head, &l->rq_tail, c->jhead, c->jtail);
-            l->rq_len += n;
-        }
+        requeue_reads(l, c->jhead); /* reads are safe to ask again */
     } else {
         /* the commit of anything sent is uncertain: never retried */
         struct req *lists[2] = {c->chead, c->jhead};

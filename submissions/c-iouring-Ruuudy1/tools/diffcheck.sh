@@ -23,10 +23,15 @@ bash "$ROOT/examples/go/build.sh" > /dev/null
 URL="postgres://conduit:conduit@127.0.0.1:5432/$DB"
 DATABASE_URL="$URL" JWT_SECRET=$SECRET HOST=127.0.0.1 PORT=3101 DB_POOL_SIZE=8 "$ROOT/examples/go/bin/conduit" > "$TMP/go.log" 2>&1 &
 PIDS="$PIDS $!"
-DATABASE_URL="$URL" JWT_SECRET=$SECRET HOST=127.0.0.1 PORT=3102 "$HERE/bin/conduit" > "$TMP/c.log" 2>&1 &
+# TEST_BIN, TEST_ENV ("KEY=VALUE ...") and DIFF_ARGS (e.g. "--threads 32 --gzip") select experiment variants.
+# shellcheck disable=SC2086
+env DATABASE_URL="$URL" JWT_SECRET=$SECRET HOST=127.0.0.1 PORT=3102 ${TEST_ENV:-} "${TEST_BIN:-$HERE/bin/conduit}" > "$TMP/c.log" 2>&1 &
 PIDS="$PIDS $!"
 for port in 3101 3102; do
   for _ in $(seq 120); do curl -sf -o /dev/null "http://127.0.0.1:$port/api/tags" && break; sleep 0.5; done
 done
 users=$(psql -X -At -d "$DB" -c "SELECT max(id) FROM users")
-python3 "$HERE/tools/diffcheck.py" --ref http://127.0.0.1:3101 --test http://127.0.0.1:3102 --secret $SECRET --n "$N" --users "$users"
+# shellcheck disable=SC2086
+python3 "$HERE/tools/diffcheck.py" --ref http://127.0.0.1:3101 --test http://127.0.0.1:3102 --secret $SECRET --n "$N" --users "$users" ${DIFF_ARGS:-}
+grep -E "failed|lost|ERROR" "$TMP/c.log" | head -5 || true
+grep -o "[0-9]* grouped" "$TMP/c.log" | awk '{s += $1} END {if (s) print s " requests answered by grouped executions"}' || true

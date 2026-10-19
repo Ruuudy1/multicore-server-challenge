@@ -19,8 +19,10 @@ cleanup() {
 }
 trap cleanup EXIT
 (cd "$ROOT/bench" && go build -o "$TMP/conformance" ./cmd/conformance)
-DATABASE_URL="postgres://conduit:conduit@127.0.0.1:5432/$DB" JWT_SECRET=multicore-server-challenge HOST=127.0.0.1 PORT="$PORT" \
-  "${BIN:-$HERE/bin/conduit}" > "$TMP/server.log" 2>&1 &
+# BIN and TEST_ENV ("KEY=VALUE ...") select experiment variants.
+# shellcheck disable=SC2086
+env DATABASE_URL="postgres://conduit:conduit@127.0.0.1:5432/$DB" JWT_SECRET=multicore-server-challenge HOST=127.0.0.1 PORT="$PORT" \
+  ${TEST_ENV:-} "${BIN:-$HERE/bin/conduit}" > "$TMP/server.log" 2>&1 &
 PID=$!
 for _ in $(seq 60); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/tags" && break; sleep 0.5; done
 "$TMP/conformance" -base "http://127.0.0.1:$PORT" -secret multicore-server-challenge -q -transcript "$TMP/transcript.jsonl" | tail -2

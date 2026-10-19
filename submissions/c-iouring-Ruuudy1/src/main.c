@@ -45,11 +45,23 @@ static void load_config(void) {
     cfg.bcrypt_wait_ms = env_int("BCRYPT_WAIT_MS", 250, 0, 60000);
     cfg.bcrypt_nice = env_int("BCRYPT_NICE", 5, -20, 19);
     static const char *const kinds[K_KINDS] = {"LIST_SHAPE_GLOBAL", "LIST_SHAPE_TAG", "LIST_SHAPE_AUTHOR", "LIST_SHAPE_FAVORITED", "LIST_SHAPE_FEED"};
+    static const char *const shapes[] = {"v1", "v2", "v1d", "v2c", "v2t"}; /* SHAPE_* order */
     for (int k = 0; k < K_KINDS; k++) {
         const char *v = getenv(kinds[k]);
-        cfg.list_shape[k] = v && !strcmp(v, "v2") ? 2 : 1;
-        if (v && strcmp(v, "v1") && strcmp(v, "v2")) die("%s must be v1 or v2", kinds[k]);
+        cfg.list_shape[k] = SHAPE_V1;
+        if (!v || !*v) continue;
+        int s = -1;
+        for (int i = 0; i < (int)ARRAY_LEN(shapes); i++) if (!strcmp(v, shapes[i])) s = i;
+        if (s < 0) die("%s must be v1, v2, v1d, v2c or v2t", kinds[k]);
+        cfg.list_shape[k] = s;
     }
+    cfg.e2_batch = env_int("E2_BATCH", 0, 0, 1);
+    cfg.e2_min = env_int("E2_MIN", 2, 2, 1024);
+    cfg.gzip_min = env_int("GZIP_MIN", 0, 0, 1 << 30);
+    cfg.gzip_level = env_int("GZIP_LEVEL", 1, 1, 12);
+#ifndef WITH_GZIP
+    if (cfg.gzip_min) { log_msg("GZIP_MIN ignored: built without gzip (build with GZIP=1)"); cfg.gzip_min = 0; }
+#endif
     const char *snap = getenv("READ_SNAPSHOT");
     cfg.read_snapshot = snap && !strcmp(snap, "batch");
     if (snap && *snap && strcmp(snap, "batch") && strcmp(snap, "statement")) die("READ_SNAPSHOT must be statement or batch");

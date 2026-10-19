@@ -25,6 +25,36 @@ static bool has_token(const char *v, uint32_t n, const char *tok) {
     return false;
 }
 
+/* Accept-Encoding lists gzip (or x-gzip) without q=0. */
+static bool accepts_gzip(const char *v, uint32_t n) {
+    uint32_t i = 0;
+    while (i < n) {
+        while (i < n && (v[i] == ' ' || v[i] == '\t' || v[i] == ',')) i++;
+        uint32_t s = i;
+        while (i < n && v[i] != ',' && v[i] != ';' && v[i] != ' ' && v[i] != '\t') i++;
+        bool gz = name_is(v + s, i - s, "gzip") || name_is(v + s, i - s, "x-gzip");
+        bool zero = false;
+        while (i < n && v[i] != ',') {
+            if (v[i] == 'q' || v[i] == 'Q') {
+                uint32_t j = i + 1;
+                while (j < n && (v[j] == ' ' || v[j] == '\t')) j++;
+                if (j < n && v[j] == '=') {
+                    j++;
+                    while (j < n && (v[j] == ' ' || v[j] == '\t')) j++;
+                    if (j < n && v[j] == '0') {
+                        zero = true;
+                        for (j++; j < n && v[j] != ',' && v[j] != ';'; j++)
+                            if (v[j] != '.' && v[j] != '0' && v[j] != ' ') zero = false;
+                    }
+                }
+            }
+            i++;
+        }
+        if (gz && !zero) return true;
+    }
+    return false;
+}
+
 static inline bool tchar(unsigned char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c && strchr("!#$%&'*+-.^_`|~", c));
 }
@@ -50,7 +80,7 @@ int http_parse(const char *buf, uint32_t n, struct http_req *h, uint32_t max_hea
     for (uint32_t i = 0; i < h->target_n; i++) if ((unsigned char)h->target[i] <= ' ' || h->target[i] == 0x7f) return -1;
     h->minor = (uint8_t)(sp2[8] - '0');
     h->keepalive = h->minor >= 1;
-    h->expect_continue = h->chunked = h->auth_present = false;
+    h->expect_continue = h->chunked = h->auth_present = h->gzip_ok = false;
     h->auth = NULL;
     h->auth_n = 0;
     h->content_length = -1;
@@ -73,6 +103,7 @@ int http_parse(const char *buf, uint32_t n, struct http_req *h, uint32_t max_hea
         switch (lower(*p)) {
         case 'a':
             if (name_is(p, nn, "authorization") && !h->auth_present && vn) { h->auth_present = true; h->auth = v; h->auth_n = vn; }
+            else if (name_is(p, nn, "accept-encoding") && accepts_gzip(v, vn)) h->gzip_ok = true;
             break;
         case 'c':
             if (name_is(p, nn, "content-length")) {

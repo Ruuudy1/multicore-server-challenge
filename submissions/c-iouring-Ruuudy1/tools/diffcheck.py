@@ -5,12 +5,15 @@
 # Only reads, so both servers see the same data. Exit code 0 only with zero differences.
 import argparse
 import base64
+import concurrent.futures
+import gzip
 import hashlib
 import hmac
 import http.client
 import json
 import random
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -28,24 +31,33 @@ def token(secret, uid, exp_delta=30 * 24 * 3600):
 
 
 class Client:
-    def __init__(self, base):
+    def __init__(self, base, gzip_ok=False):
         u = urllib.parse.urlsplit(base)
-        self.host, self.port = u.hostname, u.port
+        self.host, self.port, self.gzip_ok = u.hostname, u.port, gzip_ok
         self.conn = None
 
     def get(self, path, auth=None):
         headers = {"Authorization": auth} if auth else {}
+        if self.gzip_ok:
+            headers["Accept-Encoding"] = "gzip"
         for attempt in range(2):
             try:
                 if self.conn is None:
                     self.conn = http.client.HTTPConnection(self.host, self.port, timeout=30)
                 self.conn.request("GET", path, headers=headers)
                 r = self.conn.getresponse()
-                return r.status, r.read()
+                body = r.read()
+                if r.getheader("Content-Encoding") == "gzip":
+                    body = gzip.decompress(body)
+                    GZIPPED[0] += 1
+                return r.status, body
             except (http.client.HTTPException, ConnectionError, OSError):
                 self.conn = None
                 if attempt:
                     raise
+
+
+GZIPPED = [0]
 
 
 def normalize(status, raw):
@@ -68,9 +80,11 @@ def main():
     ap.add_argument("--n", type=int, default=2500)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--users", type=int, default=100000)
+    ap.add_argument("--threads", type=int, default=1, help="concurrent requests (E2 groups point reads only under concurrency)")
+    ap.add_argument("--gzip", action="store_true", help="send Accept-Encoding: gzip and decompress (E9)")
     a = ap.parse_args()
     rng = random.Random(a.seed)
-    ref, test = Client(a.ref), Client(a.test)
+    ref = Client(a.ref)
 
     # discover data through the reference server
     _, raw = ref.get("/api/tags")
@@ -154,25 +168,41 @@ def main():
     weights = [(g_global, 12), (g_tag, 8), (g_author, 8), (g_fav, 5), (g_combo, 4), (g_feed, 10), (g_article, 20),
                (g_comments, 20), (g_profile, 6), (g_user, 3), (g_bad, 4), (lambda: ("/api/tags", viewer()), 2)]
     total = sum(w for _, w in weights)
-    diffs = 0
-    statuses = {}
-    t0 = time.time()
-    for i in range(a.n):
+    requests = []
+    for _ in range(a.n):
         x = rng.uniform(0, total)
         for g, w in weights:
             x -= w
             if x <= 0:
                 break
-        path, auth = g()
-        r1 = normalize(*ref.get(path, auth))
-        r2 = normalize(*test.get(path, auth))
-        statuses[r1[0]] = statuses.get(r1[0], 0) + 1
-        if r1 != r2:
-            diffs += 1
-            if diffs <= 10:
-                print(f"DIFF {path} auth={'yes' if auth else 'no'}\n  ref:  {str(r1)[:400]}\n  test: {str(r2)[:400]}")
-    print(f"{a.n} requests in {time.time() - t0:.1f}s, statuses {dict(sorted(statuses.items()))}, {diffs} differences")
-    sys.exit(1 if diffs else 0)
+        requests.append(g())
+    diffs = [0]
+    statuses = {}
+    clients = threading.local()
+
+    def ask(which, req):
+        # Each thread has its own connections. The reference answers come first, then every request goes to the
+        # tested server at full concurrency (which is what makes E2 group point reads). Only reads, so the order
+        # doesn't change the answers.
+        if not hasattr(clients, which):
+            setattr(clients, which, Client(a.ref if which == "ref" else a.test, a.gzip))
+        path, auth = req
+        return normalize(*getattr(clients, which).get(path, auth))
+
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=a.threads) as pool:
+        refs = list(pool.map(lambda req: ask("ref", req), requests))
+        tests = list(pool.map(lambda req: ask("test", req), requests))
+        for (path, auth), r1, r2 in zip(requests, refs, tests):
+            statuses[r1[0]] = statuses.get(r1[0], 0) + 1
+            if r1 != r2:
+                diffs[0] += 1
+                if diffs[0] <= 10:
+                    print(f"DIFF {path} auth={'yes' if auth else 'no'}\n  ref:  {str(r1)[:400]}\n  test: {str(r2)[:400]}")
+    gz = f", {GZIPPED[0]} gzip-encoded responses" if a.gzip else ""
+    print(f"{a.n} requests in {time.time() - t0:.1f}s on {a.threads} threads, statuses {dict(sorted(statuses.items()))}{gz}, "
+          f"{diffs[0]} differences")
+    sys.exit(1 if diffs[0] else 0)
 
 
 if __name__ == "__main__":

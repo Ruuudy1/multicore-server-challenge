@@ -273,6 +273,7 @@ static uint32_t conn_process(struct loop *l, struct conn *c, const char *data, u
     r->t0_ms = l->now_ms;
     if (!h.keepalive) r->flags |= RQ_CLOSE;
     else if (h.minor == 0) r->flags |= RQ_KEEPALIVE10;
+    if (h.gzip_ok) r->flags |= RQ_GZIP;
     c->req = r;
     l->st.requests++;
     api_dispatch(r, &h, body, body_n);
@@ -434,7 +435,7 @@ static void on_continue(struct loop *l, struct io_uring_cqe *cqe) {
         return;
     }
     if (c->req && (c->req->flags & RQ_PENDING)) {
-        c->req->flags &= (uint8_t)~RQ_PENDING;
+        c->req->flags &= (uint16_t)~RQ_PENDING;
         c->sent = 0;
         conn_send(l, c, c->req);
     }

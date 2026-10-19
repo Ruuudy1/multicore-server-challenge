@@ -33,17 +33,42 @@ static const char *status_line(int status, uint32_t *n) {
 
 #define PUT(lit) do { memcpy(h + n, lit, sizeof(lit) - 1); n += sizeof(lit) - 1; } while (0)
 
+#ifdef WITH_GZIP
+#include <libdeflate.h>
+/* E9: replaces the body with its gzip encoding when that is smaller. One compressor per loop thread. */
+static __thread struct libdeflate_compressor *gz;
+static bool gzip_body(struct req *r) {
+    uint32_t n = r->out.len - HDR_RESERVE;
+    if (!gz && !(gz = libdeflate_alloc_compressor(cfg.gzip_level))) return false;
+    size_t bound = libdeflate_gzip_compress_bound(gz, n);
+    obuf_t z;
+    ob_init(&z, HDR_RESERVE + (uint32_t)bound);
+    size_t zn = libdeflate_gzip_compress(gz, r->out.p + HDR_RESERVE, n, z.p + HDR_RESERVE, bound);
+    if (!zn || zn >= n) { ob_free(&z); return false; }
+    ob_free(&r->out);
+    r->out = z;
+    r->out.len = HDR_RESERVE + (uint32_t)zn;
+    return true;
+}
+#endif
+
 static void finish(struct req *r, int status, bool body) {
     char h[HDR_RESERVE];
     uint32_t n, sl;
     const char *line = status_line(status, &sl);
     memcpy(h, line, sl);
     n = sl;
+    bool gzipped = false;
+#ifdef WITH_GZIP
+    if (body && cfg.gzip_min && (r->flags & RQ_GZIP) && status < 300 && r->out.len - HDR_RESERVE >= (uint32_t)cfg.gzip_min)
+        gzipped = gzip_body(r);
+#endif
     if (body) {
         PUT("Content-Type: application/json\r\nContent-Length: ");
         n += fmt_i64(h + n, (int64_t)(r->out.len - HDR_RESERVE));
         PUT("\r\n");
     }
+    if (gzipped) PUT("Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n");
     if (r->flags & RQ_CLOSE) PUT("Connection: close\r\n");
     else if (r->flags & RQ_KEEPALIVE10) PUT("Connection: keep-alive\r\n");
     PUT("\r\n");
@@ -70,7 +95,7 @@ void resp_error(struct req *r, int status, const char *msg) {
 
 void resp_reset(struct req *r) {
     ob_free(&r->out);
-    r->flags &= (uint8_t)~RQ_READY;
+    r->flags &= (uint16_t)~RQ_READY;
     r->hdr_off = 0;
 }
 

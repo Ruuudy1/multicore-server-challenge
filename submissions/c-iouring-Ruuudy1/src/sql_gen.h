@@ -147,6 +147,171 @@
 #define SQL_L2_FEED_NPARAMS 4
 #define SQL_L2_FEED_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
 
+#define SQL_L1D_GLOBAL \
+    "WITH p AS MATERIALIZED (SELECT a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at FROM (SELECT id FROM articles ORDER BY id DESC OFFSET $3 LIMIT 100) b JOIN articles a ON a.id = b.id ORDER BY a.id DESC LIMIT $2), au AS MATERIALIZED (SELECT u.id, u.username, u.bio, u.image FROM (SELECT DISTINCT author_id FROM p) d CROSS JOIN LATERAL (SELECT id, username, bio, image FROM users WHERE id = d.author_id OFFSET 0) u) SELECT c.n, p.id, p.author_id, p.slug, p.title, p.description, p.created_at, p.updated_at, ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = p.id ORDER BY 1) AS tag_list, (SELECT count(*) FROM favorites f WHERE f.article_id = p.id) AS favorites_count, EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = $1 AND f.article_id = p.id) AS favorited, au.username, au.bio, au.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = p.author_id) AS following FROM (SELECT CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM articles) END AS n) c LEFT JOIN p ON true LEFT JOIN au ON au.id = p.author_id ORDER BY p.id DESC"
+#define SQL_L1D_GLOBAL_NPARAMS 4
+#define SQL_L1D_GLOBAL_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L1D_TAG \
+    "WITH tid AS MATERIALIZED (SELECT t.id FROM tags t WHERE t.name = $4), p AS MATERIALIZED (SELECT a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at FROM (SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = (SELECT id FROM tid) ORDER BY at.article_id DESC OFFSET $3 LIMIT 100) b JOIN articles a ON a.id = b.id ORDER BY a.id DESC LIMIT $2), au AS MATERIALIZED (SELECT u.id, u.username, u.bio, u.image FROM (SELECT DISTINCT author_id FROM p) d CROSS JOIN LATERAL (SELECT id, username, bio, image FROM users WHERE id = d.author_id OFFSET 0) u) SELECT c.n, p.id, p.author_id, p.slug, p.title, p.description, p.created_at, p.updated_at, ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = p.id ORDER BY 1) AS tag_list, (SELECT count(*) FROM favorites f WHERE f.article_id = p.id) AS favorites_count, EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = $1 AND f.article_id = p.id) AS favorited, au.username, au.bio, au.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = p.author_id) AS following FROM (SELECT CASE WHEN EXISTS (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT id FROM tid) ORDER BY at.article_id OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT id FROM tid) ORDER BY at.article_id LIMIT 1000) s) END AS n) c LEFT JOIN p ON true LEFT JOIN au ON au.id = p.author_id ORDER BY p.id DESC"
+#define SQL_L1D_TAG_NPARAMS 4
+#define SQL_L1D_TAG_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L1D_AUTHOR \
+    "WITH p AS MATERIALIZED (SELECT a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at FROM (SELECT a.id FROM articles a WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) ORDER BY a.id DESC OFFSET $3 LIMIT 100) b JOIN articles a ON a.id = b.id ORDER BY a.id DESC LIMIT $2), au AS MATERIALIZED (SELECT u.id, u.username, u.bio, u.image FROM (SELECT DISTINCT author_id FROM p) d CROSS JOIN LATERAL (SELECT id, username, bio, image FROM users WHERE id = d.author_id OFFSET 0) u) SELECT c.n, p.id, p.author_id, p.slug, p.title, p.description, p.created_at, p.updated_at, ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = p.id ORDER BY 1) AS tag_list, (SELECT count(*) FROM favorites f WHERE f.article_id = p.id) AS favorites_count, EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = $1 AND f.article_id = p.id) AS favorited, au.username, au.bio, au.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = p.author_id) AS following FROM (SELECT (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) ORDER BY a.id LIMIT 1000) s) AS n) c LEFT JOIN p ON true LEFT JOIN au ON au.id = p.author_id ORDER BY p.id DESC"
+#define SQL_L1D_AUTHOR_NPARAMS 4
+#define SQL_L1D_AUTHOR_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L1D_FAVORITED \
+    "WITH p AS MATERIALIZED (SELECT a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at FROM (SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id DESC OFFSET $3 LIMIT 100) b JOIN articles a ON a.id = b.id ORDER BY a.id DESC LIMIT $2), au AS MATERIALIZED (SELECT u.id, u.username, u.bio, u.image FROM (SELECT DISTINCT author_id FROM p) d CROSS JOIN LATERAL (SELECT id, username, bio, image FROM users WHERE id = d.author_id OFFSET 0) u) SELECT c.n, p.id, p.author_id, p.slug, p.title, p.description, p.created_at, p.updated_at, ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = p.id ORDER BY 1) AS tag_list, (SELECT count(*) FROM favorites f WHERE f.article_id = p.id) AS favorites_count, EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = $1 AND f.article_id = p.id) AS favorited, au.username, au.bio, au.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = p.author_id) AS following FROM (SELECT (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id LIMIT 1000) s) AS n) c LEFT JOIN p ON true LEFT JOIN au ON au.id = p.author_id ORDER BY p.id DESC"
+#define SQL_L1D_FAVORITED_NPARAMS 4
+#define SQL_L1D_FAVORITED_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L1D_FEED \
+    "WITH p AS MATERIALIZED (SELECT a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT ($2::int + $3::int)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC OFFSET $3 LIMIT 100) b JOIN articles a ON a.id = b.id ORDER BY a.id DESC LIMIT $2), au AS MATERIALIZED (SELECT u.id, u.username, u.bio, u.image FROM (SELECT DISTINCT author_id FROM p) d CROSS JOIN LATERAL (SELECT id, username, bio, image FROM users WHERE id = d.author_id OFFSET 0) u) SELECT c.n, p.id, p.author_id, p.slug, p.title, p.description, p.created_at, p.updated_at, ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = p.id ORDER BY 1) AS tag_list, (SELECT count(*) FROM favorites f WHERE f.article_id = p.id) AS favorites_count, EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = $1 AND f.article_id = p.id) AS favorited, au.username, au.bio, au.image, true AS following FROM (SELECT CASE WHEN EXISTS (SELECT 1 FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)) OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1))) END AS n) c LEFT JOIN p ON true LEFT JOIN au ON au.id = p.author_id ORDER BY p.id DESC"
+#define SQL_L1D_FEED_NPARAMS 4
+#define SQL_L1D_FEED_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L2C_GLOBAL \
+    "WITH p AS MATERIALIZED (SELECT id FROM (SELECT id FROM articles ORDER BY id DESC OFFSET $3 LIMIT 100) b LIMIT $2), r AS MATERIALIZED (SELECT min(id) AS lo, max(id) AS hi FROM p) SELECT 0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::text AS slug, NULL::text AS title, NULL::text AS description, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text AS username, NULL::text AS bio, NULL::text AS image,\n" \
+    "       CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM articles) END AS n, fc.ids, fc.cnts,\n" \
+    "       ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND f.article_id BETWEEN r.lo AND r.hi) AS my_favs,\n" \
+    "       ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) AS my_follows, tg.aids, tg.names\n" \
+    "  FROM r\n" \
+    "  LEFT JOIN LATERAL (SELECT ARRAY(SELECT f.article_id FROM favorites f WHERE f.article_id BETWEEN r.lo AND r.hi) AS ids, NULL::bigint[] AS cnts) fc ON true\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(at.article_id ORDER BY t.name, at.article_id) AS aids, array_agg(t.name ORDER BY t.name, at.article_id) AS names\n" \
+    "                       FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id BETWEEN r.lo AND r.hi) tg ON true UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u"
+#define SQL_L2C_GLOBAL_NPARAMS 4
+#define SQL_L2C_GLOBAL_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L2C_TAG \
+    "WITH tid AS MATERIALIZED (SELECT t.id FROM tags t WHERE t.name = $4), p AS MATERIALIZED (SELECT id FROM (SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = (SELECT id FROM tid) ORDER BY at.article_id DESC OFFSET $3 LIMIT 100) b LIMIT $2), r AS MATERIALIZED (SELECT coalesce(array_agg(id), '{}') AS ids FROM p) SELECT 0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::text AS slug, NULL::text AS title, NULL::text AS description, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text AS username, NULL::text AS bio, NULL::text AS image,\n" \
+    "       CASE WHEN EXISTS (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT id FROM tid) ORDER BY at.article_id OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT id FROM tid) ORDER BY at.article_id LIMIT 1000) s) END AS n, fc.ids, fc.cnts,\n" \
+    "       ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND f.article_id = ANY(r.ids)) AS my_favs,\n" \
+    "       ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) AS my_follows, tg.aids, tg.names\n" \
+    "  FROM r\n" \
+    "  LEFT JOIN LATERAL (SELECT ARRAY(SELECT f.article_id FROM favorites f WHERE f.article_id = ANY(r.ids)) AS ids, NULL::bigint[] AS cnts) fc ON true\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(at.article_id ORDER BY t.name, at.article_id) AS aids, array_agg(t.name ORDER BY t.name, at.article_id) AS names\n" \
+    "                       FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = ANY(r.ids)) tg ON true UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u"
+#define SQL_L2C_TAG_NPARAMS 4
+#define SQL_L2C_TAG_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L2C_AUTHOR \
+    "WITH p AS MATERIALIZED (SELECT id FROM (SELECT a.id FROM articles a WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) ORDER BY a.id DESC OFFSET $3 LIMIT 100) b LIMIT $2), r AS MATERIALIZED (SELECT coalesce(array_agg(id), '{}') AS ids FROM p) SELECT 0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::text AS slug, NULL::text AS title, NULL::text AS description, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text AS username, NULL::text AS bio, NULL::text AS image,\n" \
+    "       (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) ORDER BY a.id LIMIT 1000) s) AS n, fc.ids, fc.cnts,\n" \
+    "       ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND f.article_id = ANY(r.ids)) AS my_favs,\n" \
+    "       ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) AS my_follows, tg.aids, tg.names\n" \
+    "  FROM r\n" \
+    "  LEFT JOIN LATERAL (SELECT ARRAY(SELECT f.article_id FROM favorites f WHERE f.article_id = ANY(r.ids)) AS ids, NULL::bigint[] AS cnts) fc ON true\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(at.article_id ORDER BY t.name, at.article_id) AS aids, array_agg(t.name ORDER BY t.name, at.article_id) AS names\n" \
+    "                       FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = ANY(r.ids)) tg ON true UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u"
+#define SQL_L2C_AUTHOR_NPARAMS 4
+#define SQL_L2C_AUTHOR_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L2C_FAVORITED \
+    "WITH p AS MATERIALIZED (SELECT id FROM (SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id DESC OFFSET $3 LIMIT 100) b LIMIT $2), r AS MATERIALIZED (SELECT coalesce(array_agg(id), '{}') AS ids FROM p) SELECT 0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::text AS slug, NULL::text AS title, NULL::text AS description, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text AS username, NULL::text AS bio, NULL::text AS image,\n" \
+    "       (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id LIMIT 1000) s) AS n, fc.ids, fc.cnts,\n" \
+    "       ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND f.article_id = ANY(r.ids)) AS my_favs,\n" \
+    "       ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) AS my_follows, tg.aids, tg.names\n" \
+    "  FROM r\n" \
+    "  LEFT JOIN LATERAL (SELECT ARRAY(SELECT f.article_id FROM favorites f WHERE f.article_id = ANY(r.ids)) AS ids, NULL::bigint[] AS cnts) fc ON true\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(at.article_id ORDER BY t.name, at.article_id) AS aids, array_agg(t.name ORDER BY t.name, at.article_id) AS names\n" \
+    "                       FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = ANY(r.ids)) tg ON true UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u"
+#define SQL_L2C_FAVORITED_NPARAMS 4
+#define SQL_L2C_FAVORITED_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L2C_FEED \
+    "WITH p AS MATERIALIZED (SELECT id FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT ($2::int + $3::int)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC OFFSET $3 LIMIT 100) b LIMIT $2), r AS MATERIALIZED (SELECT coalesce(array_agg(id), '{}') AS ids FROM p) SELECT 0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::text AS slug, NULL::text AS title, NULL::text AS description, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text AS username, NULL::text AS bio, NULL::text AS image,\n" \
+    "       CASE WHEN EXISTS (SELECT 1 FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)) OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1))) END AS n, fc.ids, fc.cnts,\n" \
+    "       ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND f.article_id = ANY(r.ids)) AS my_favs,\n" \
+    "       '{}'::bigint[] AS my_follows, tg.aids, tg.names\n" \
+    "  FROM r\n" \
+    "  LEFT JOIN LATERAL (SELECT ARRAY(SELECT f.article_id FROM favorites f WHERE f.article_id = ANY(r.ids)) AS ids, NULL::bigint[] AS cnts) fc ON true\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(at.article_id ORDER BY t.name, at.article_id) AS aids, array_agg(t.name ORDER BY t.name, at.article_id) AS names\n" \
+    "                       FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = ANY(r.ids)) tg ON true UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u"
+#define SQL_L2C_FEED_NPARAMS 4
+#define SQL_L2C_FEED_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L2T_GLOBAL \
+    "WITH p AS MATERIALIZED (SELECT id FROM (SELECT id FROM articles ORDER BY id DESC OFFSET $3 LIMIT 100) b LIMIT $2), r AS MATERIALIZED (SELECT min(id) AS lo, max(id) AS hi FROM p) SELECT 0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::text AS slug, NULL::text AS title, NULL::text AS description, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text AS username, NULL::text AS bio, NULL::text AS image,\n" \
+    "       CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM articles) END AS n, fc.ids, fc.cnts,\n" \
+    "       ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND f.article_id BETWEEN r.lo AND r.hi) AS my_favs,\n" \
+    "       ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) AS my_follows, tg.aids, tg.names\n" \
+    "  FROM r\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(g.article_id ORDER BY g.article_id) AS ids, array_agg(g.n ORDER BY g.article_id) AS cnts\n" \
+    "                       FROM (SELECT f.article_id, count(*) AS n FROM favorites f WHERE f.article_id BETWEEN r.lo AND r.hi GROUP BY f.article_id) g) fc ON true\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(x.article_id ORDER BY x.name, x.article_id) AS aids, array_agg(x.name ORDER BY x.name, x.article_id) AS names FROM (SELECT at.article_id, t.name FROM article_tags at CROSS JOIN LATERAL (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id OFFSET 0) t WHERE at.article_id BETWEEN r.lo AND r.hi) x) tg ON true UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u"
+#define SQL_L2T_GLOBAL_NPARAMS 4
+#define SQL_L2T_GLOBAL_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L2T_TAG \
+    "WITH tid AS MATERIALIZED (SELECT t.id FROM tags t WHERE t.name = $4), p AS MATERIALIZED (SELECT id FROM (SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = (SELECT id FROM tid) ORDER BY at.article_id DESC OFFSET $3 LIMIT 100) b LIMIT $2), r AS MATERIALIZED (SELECT coalesce(array_agg(id), '{}') AS ids FROM p) SELECT 0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::text AS slug, NULL::text AS title, NULL::text AS description, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text AS username, NULL::text AS bio, NULL::text AS image,\n" \
+    "       CASE WHEN EXISTS (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT id FROM tid) ORDER BY at.article_id OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT id FROM tid) ORDER BY at.article_id LIMIT 1000) s) END AS n, fc.ids, fc.cnts,\n" \
+    "       ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND f.article_id = ANY(r.ids)) AS my_favs,\n" \
+    "       ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) AS my_follows, tg.aids, tg.names\n" \
+    "  FROM r\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(g.article_id ORDER BY g.article_id) AS ids, array_agg(g.n ORDER BY g.article_id) AS cnts\n" \
+    "                       FROM (SELECT f.article_id, count(*) AS n FROM favorites f WHERE f.article_id = ANY(r.ids) GROUP BY f.article_id) g) fc ON true\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(x.article_id ORDER BY x.name, x.article_id) AS aids, array_agg(x.name ORDER BY x.name, x.article_id) AS names FROM (SELECT at.article_id, t.name FROM article_tags at CROSS JOIN LATERAL (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id OFFSET 0) t WHERE at.article_id = ANY(r.ids)) x) tg ON true UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u"
+#define SQL_L2T_TAG_NPARAMS 4
+#define SQL_L2T_TAG_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L2T_AUTHOR \
+    "WITH p AS MATERIALIZED (SELECT id FROM (SELECT a.id FROM articles a WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) ORDER BY a.id DESC OFFSET $3 LIMIT 100) b LIMIT $2), r AS MATERIALIZED (SELECT coalesce(array_agg(id), '{}') AS ids FROM p) SELECT 0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::text AS slug, NULL::text AS title, NULL::text AS description, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text AS username, NULL::text AS bio, NULL::text AS image,\n" \
+    "       (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) ORDER BY a.id LIMIT 1000) s) AS n, fc.ids, fc.cnts,\n" \
+    "       ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND f.article_id = ANY(r.ids)) AS my_favs,\n" \
+    "       ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) AS my_follows, tg.aids, tg.names\n" \
+    "  FROM r\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(g.article_id ORDER BY g.article_id) AS ids, array_agg(g.n ORDER BY g.article_id) AS cnts\n" \
+    "                       FROM (SELECT f.article_id, count(*) AS n FROM favorites f WHERE f.article_id = ANY(r.ids) GROUP BY f.article_id) g) fc ON true\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(x.article_id ORDER BY x.name, x.article_id) AS aids, array_agg(x.name ORDER BY x.name, x.article_id) AS names FROM (SELECT at.article_id, t.name FROM article_tags at CROSS JOIN LATERAL (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id OFFSET 0) t WHERE at.article_id = ANY(r.ids)) x) tg ON true UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u"
+#define SQL_L2T_AUTHOR_NPARAMS 4
+#define SQL_L2T_AUTHOR_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L2T_FAVORITED \
+    "WITH p AS MATERIALIZED (SELECT id FROM (SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id DESC OFFSET $3 LIMIT 100) b LIMIT $2), r AS MATERIALIZED (SELECT coalesce(array_agg(id), '{}') AS ids FROM p) SELECT 0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::text AS slug, NULL::text AS title, NULL::text AS description, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text AS username, NULL::text AS bio, NULL::text AS image,\n" \
+    "       (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id LIMIT 1000) s) AS n, fc.ids, fc.cnts,\n" \
+    "       ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND f.article_id = ANY(r.ids)) AS my_favs,\n" \
+    "       ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) AS my_follows, tg.aids, tg.names\n" \
+    "  FROM r\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(g.article_id ORDER BY g.article_id) AS ids, array_agg(g.n ORDER BY g.article_id) AS cnts\n" \
+    "                       FROM (SELECT f.article_id, count(*) AS n FROM favorites f WHERE f.article_id = ANY(r.ids) GROUP BY f.article_id) g) fc ON true\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(x.article_id ORDER BY x.name, x.article_id) AS aids, array_agg(x.name ORDER BY x.name, x.article_id) AS names FROM (SELECT at.article_id, t.name FROM article_tags at CROSS JOIN LATERAL (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id OFFSET 0) t WHERE at.article_id = ANY(r.ids)) x) tg ON true UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u"
+#define SQL_L2T_FAVORITED_NPARAMS 4
+#define SQL_L2T_FAVORITED_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_L2T_FEED \
+    "WITH p AS MATERIALIZED (SELECT id FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT ($2::int + $3::int)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC OFFSET $3 LIMIT 100) b LIMIT $2), r AS MATERIALIZED (SELECT coalesce(array_agg(id), '{}') AS ids FROM p) SELECT 0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::text AS slug, NULL::text AS title, NULL::text AS description, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::text AS username, NULL::text AS bio, NULL::text AS image,\n" \
+    "       CASE WHEN EXISTS (SELECT 1 FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)) OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1))) END AS n, fc.ids, fc.cnts,\n" \
+    "       ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND f.article_id = ANY(r.ids)) AS my_favs,\n" \
+    "       '{}'::bigint[] AS my_follows, tg.aids, tg.names\n" \
+    "  FROM r\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(g.article_id ORDER BY g.article_id) AS ids, array_agg(g.n ORDER BY g.article_id) AS cnts\n" \
+    "                       FROM (SELECT f.article_id, count(*) AS n FROM favorites f WHERE f.article_id = ANY(r.ids) GROUP BY f.article_id) g) fc ON true\n" \
+    "  LEFT JOIN LATERAL (SELECT array_agg(x.article_id ORDER BY x.name, x.article_id) AS aids, array_agg(x.name ORDER BY x.name, x.article_id) AS names FROM (SELECT at.article_id, t.name FROM article_tags at CROSS JOIN LATERAL (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id OFFSET 0) t WHERE at.article_id = ANY(r.ids)) x) tg ON true UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, NULL::bigint, NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::text[] FROM p JOIN articles a ON a.id = p.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u"
+#define SQL_L2T_FEED_NPARAMS 4
+#define SQL_L2T_FEED_PTYPES {OID_INT8, OID_INT4, OID_INT4, OID_TEXT}
+
+#define SQL_A_GET_B \
+    "SELECT r.ord, a.title, a.description, a.body, a.created_at, a.updated_at, ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list, (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = r.viewer AND f.article_id = a.id) AS favorited, u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = a.author_id) AS following FROM unnest($1::bigint[], $2::bigint[], $3::text[]) WITH ORDINALITY AS r(viewer, id, slug, ord) JOIN articles a ON a.id = r.id AND a.slug = r.slug COLLATE \"C\" JOIN users u ON u.id = a.author_id"
+#define SQL_A_GET_B_NPARAMS 3
+#define SQL_A_GET_B_PTYPES {OID_INT8_ARRAY, OID_INT8_ARRAY, OID_TEXT_ARRAY}
+
+#define SQL_C_LIST_B \
+    "SELECT r.ord, 0 AS k, NULL::bigint AS id, NULL::text AS body, NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::bigint AS author_id, NULL::text AS username, NULL::text AS bio, NULL::text AS image, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer) AS my_follows FROM unnest($1::bigint[], $2::bigint[], $3::text[]) WITH ORDINALITY AS r(viewer, id, slug, ord) JOIN articles a ON a.id = r.id AND a.slug = r.slug COLLATE \"C\" UNION ALL SELECT r.ord, 1, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image, NULL FROM unnest($1::bigint[], $2::bigint[], $3::text[]) WITH ORDINALITY AS r(viewer, id, slug, ord) CROSS JOIN LATERAL (SELECT id, body, created_at, updated_at, author_id FROM comments WHERE article_id = r.id ORDER BY created_at DESC, id DESC LIMIT 100) c CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = c.author_id OFFSET 0) u"
+#define SQL_C_LIST_B_NPARAMS 3
+#define SQL_C_LIST_B_PTYPES {OID_INT8_ARRAY, OID_INT8_ARRAY, OID_TEXT_ARRAY}
+
+#define SQL_P_GET_B \
+    "SELECT r.ord, u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = u.id) AS following FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS r(viewer, username, ord) JOIN users u ON u.username = r.username"
+#define SQL_P_GET_B_NPARAMS 2
+#define SQL_P_GET_B_PTYPES {OID_INT8_ARRAY, OID_TEXT_ARRAY}
+
+#define SQL_U_GET_B \
+    "SELECT r.ord, u.username, u.email, u.bio, u.image FROM unnest($1::bigint[]) WITH ORDINALITY AS r(id, ord) JOIN users u ON u.id = r.id"
+#define SQL_U_GET_B_NPARAMS 1
+#define SQL_U_GET_B_PTYPES {OID_INT8_ARRAY}
+
 #define SQL_U_REGISTER \
     "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, bio, image"
 #define SQL_U_REGISTER_NPARAMS 3

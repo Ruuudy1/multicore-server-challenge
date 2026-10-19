@@ -114,7 +114,18 @@ static void list2_done(struct req *r, struct pgres *res) {
     struct kv counts[128];
     uint32_t nc = 0;
     struct pgarr ids, cnts;
-    if (pgarr_open(&ids, pv_p(res, h, 12), pv_n(res, h, 12)) && pgarr_open(&cnts, pv_p(res, h, 13), pv_n(res, h, 13))) {
+    if (pv_null(res, h, 13)) {
+        /* E7: one article id per favorite on the page, counted here */
+        int64_t raw_buf[1024], *raw;
+        uint32_t nr = pgarr_i64_sorted(pv_p(res, h, 12), pv_n(res, h, 12), raw_buf, ARRAY_LEN(raw_buf), &raw);
+        for (uint32_t i = 0; i < nr;) {
+            uint32_t j = i;
+            while (j < nr && raw[j] == raw[i]) j++;
+            if (nc < ARRAY_LEN(counts)) counts[nc++] = (struct kv){raw[i], (int64_t)(j - i)};
+            i = j;
+        }
+        if (raw != raw_buf) free(raw);
+    } else if (pgarr_open(&ids, pv_p(res, h, 12), pv_n(res, h, 12)) && pgarr_open(&cnts, pv_p(res, h, 13), pv_n(res, h, 13))) {
         for (uint32_t i = 0; i < ids.n && nc < ARRAY_LEN(counts); i++) {
             const char *a, *b;
             int32_t an, bn;
@@ -204,12 +215,15 @@ void api_list(struct req *r, const char *q, uint32_t qn, bool feed) {
     /* Offsets past any possible table size give the same empty page; this keeps $3 and $2 + $3 in int4. */
     if (offset > 2000000000) offset = 2000000000;
     r->kind = (uint8_t)kind;
-    bool v2 = cfg.list_shape[kind] == 2;
+    static const int base[] = {[SHAPE_V1] = S_L1_GLOBAL, [SHAPE_V2] = S_L2_GLOBAL, [SHAPE_V1D] = S_L1D_GLOBAL,
+                               [SHAPE_V2C] = S_L2C_GLOBAL, [SHAPE_V2T] = S_L2T_GLOBAL};
+    int shape = cfg.list_shape[kind];
+    bool v2 = shape == SHAPE_V2 || shape == SHAPE_V2C || shape == SHAPE_V2T;
     prm_i64(r, 0, r->viewer);
     prm_i32(r, 1, (int32_t)limit);
     prm_i32(r, 2, (int32_t)offset);
     prm_str(r, 3, filter);
-    db_read(r, (v2 ? S_L2_GLOBAL : S_L1_GLOBAL) + kind, 4, v2 ? list2_done : list1_done);
+    db_read(r, base[shape] + kind, 4, v2 ? list2_done : list1_done);
 }
 
 /* ---------- single article ---------- */

@@ -19,14 +19,18 @@
 /* ---------- configuration (main.c) ---------- */
 
 enum { K_GLOBAL, K_TAG, K_AUTHOR, K_FAVORITED, K_FEED, K_KINDS };
+/* List SQL shapes: v1 per-row decoration (default), v2 header facts, and the E10/E7/E8 variants. */
+enum { SHAPE_V1, SHAPE_V2, SHAPE_V1D, SHAPE_V2C, SHAPE_V2T };
 
 struct config {
     const char *database_url, *jwt_secret, *host, *port;
     int loops, pg_read_conns, pg_write_conns, pg_depth, read_batch, write_batch;
     int uring_busy_cqe, uring_min_cqe, uring_wait_us;
     int bcrypt_threads, bcrypt_lanes, bcrypt_wait_ms, bcrypt_nice;
-    int list_shape[K_KINDS]; /* 1 = v1 per-row decoration, 2 = v2 header facts */
+    int list_shape[K_KINDS]; /* SHAPE_*: the list SQL per kind */
     int read_snapshot;       /* 1: read connections use repeatable read (one snapshot per batch) */
+    int e2_batch, e2_min;    /* E2: group concurrent point reads of one statement into one execution */
+    int gzip_min, gzip_level;/* E9: gzip JSON bodies of at least gzip_min bytes (0 = off; needs a GZIP=1 build) */
     int stats;
     uint32_t max_header, max_body;
 };
@@ -129,6 +133,10 @@ enum stmt_id {
     S_U_GET, S_U_LOGIN, S_P_GET, S_T_LIST, S_A_GET, S_A_GET_SLUG, S_C_LIST,
     S_L1_GLOBAL, S_L1_TAG, S_L1_AUTHOR, S_L1_FAVORITED, S_L1_FEED,
     S_L2_GLOBAL, S_L2_TAG, S_L2_AUTHOR, S_L2_FAVORITED, S_L2_FEED,
+    S_L1D_GLOBAL, S_L1D_TAG, S_L1D_AUTHOR, S_L1D_FAVORITED, S_L1D_FEED,   /* E10: v1, one users look-up per author */
+    S_L2C_GLOBAL, S_L2C_TAG, S_L2C_AUTHOR, S_L2C_FAVORITED, S_L2C_FEED,   /* E7: v2, favorites counted in C */
+    S_L2T_GLOBAL, S_L2T_TAG, S_L2T_AUTHOR, S_L2T_FAVORITED, S_L2T_FEED,   /* E8: v2, tag names by key probes */
+    S_A_GET_B, S_C_LIST_B, S_P_GET_B, S_U_GET_B,                          /* E2: batched point reads */
     S_FIRST_WRITE,
     S_U_REGISTER = S_FIRST_WRITE, S_U_UPDATE, S_P_FOLLOW, S_P_UNFOLLOW, S_C_ADD, S_C_DEL, S_F_ADD, S_F_DEL,
     S_A_ADD, S_A_PUT, S_A_DEL,
@@ -214,16 +222,19 @@ struct pgparam { const char *p; int32_t len; };   /* len < 0: NULL */
 struct req;
 typedef void (*pg_done_fn)(struct req *r, struct pgres *res);
 
-#define HDR_RESERVE 160   /* response header space in front of the body */
+#define HDR_RESERVE 192   /* response header space in front of the body (the longest header is 179 bytes) */
 #define ARENA_INLINE 1024
 
-enum { RQ_HEAD = 1, RQ_CLOSE = 2, RQ_KEEPALIVE10 = 4, RQ_ORPHAN = 8, RQ_ALONE = 16, RQ_READY = 32, RQ_PENDING = 64 };
+enum { RQ_HEAD = 1, RQ_CLOSE = 2, RQ_KEEPALIVE10 = 4, RQ_ORPHAN = 8, RQ_ALONE = 16, RQ_READY = 32, RQ_PENDING = 64,
+       RQ_GROUP = 128, RQ_GZIP = 256 };
 
 struct req {
     struct req *next;           /* scheduler queue link */
     struct loop *loop;
+    struct req *gnext;          /* E2: the other requests answered by the same execution (RQ_GROUP leader) */
     uint32_t slot, gen;         /* owning client connection */
-    uint8_t route, stmt, flags, retries;
+    uint8_t route, stmt, retries, gsize;
+    uint16_t flags;
     uint8_t nparams, kind;
     int16_t status;
     uint16_t hdr_off;           /* where the response header starts in out.p */
@@ -276,7 +287,7 @@ void req_free(struct req *r);
 enum { M_GET, M_POST, M_PUT, M_DELETE, M_HEAD, M_OTHER };
 struct http_req {
     uint8_t method, minor;      /* HTTP/1.minor */
-    bool keepalive, expect_continue, chunked, auth_present;
+    bool keepalive, expect_continue, chunked, auth_present, gzip_ok;
     const char *target; uint32_t target_n;   /* request-target as sent */
     const char *auth; uint32_t auth_n;       /* Authorization value, OWS trimmed */
     int64_t content_length;                  /* -1 when absent */
@@ -332,7 +343,7 @@ extern int nloops;
 
 struct lstats {
     uint64_t requests, responses, accepts, closes, cqes, waits, pg_batches, pg_jobs, pg_wbatches, pg_wjobs;
-    uint64_t lat_sum_ms, lat_max_ms, bcrypt_jobs;
+    uint64_t lat_sum_ms, lat_max_ms, bcrypt_jobs, grouped;
     uint32_t open_conns, fifo_len, wq_len;
 };
 void stats_start(void);

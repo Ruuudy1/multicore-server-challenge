@@ -7,8 +7,13 @@ import random
 import re
 import sys
 import psycopg2
-from statements import (ARTICLE, ARTICLE_BY_SLUG, COMMENTS, FULL_SELECT, REFERENCE, REFERENCE_COMMENTS, REFERENCE_USERS, SIGNATURES,
-                        USER_SIGNATURES, USERS, V1, V2, WRITES)
+from collections import Counter
+
+from statements import (ARTICLE, ARTICLE_BY_SLUG, BATCHED, BATCHED_SIGNATURES, COMMENTS, FULL_SELECT, REFERENCE, REFERENCE_COMMENTS,
+                        REFERENCE_USERS, SIGNATURES, USER_SIGNATURES, USERS, V1, V1D, V2, V2C, V2T, WRITES)
+
+# Experiment variants of the list statements, checked like v1 and v2 (statements.py: E10, E7, E8).
+VARIANTS = {"v1d": V1D, "v2c": V2C, "v2t": V2T}
 
 SESSION = ["SET plan_cache_mode = force_generic_plan", "SET jit = off", "SET max_parallel_workers_per_gather = 0", "SET TimeZone = 'UTC'"]
 # The box's pgtune values (box/pg-conf.sh for 8 vCPU / 16 GB); generic plans differ without them.
@@ -52,6 +57,10 @@ def prepare(cur):
         cur.execute(f"PREPARE ref_{kind}_count(bigint, int, int, text) AS {count}")
         cur.execute(f"PREPARE v1_{kind}(bigint, int, int, text) AS {V1[kind]}")
         cur.execute(f"PREPARE v2_{kind}(bigint, int, int, text) AS {V2[kind]}")
+        for variant, sqls in VARIANTS.items():
+            cur.execute(f"PREPARE {variant}_{kind}(bigint, int, int, text) AS {sqls[kind]}")
+    for name, sql in BATCHED.items():
+        cur.execute(f"PREPARE {name}{BATCHED_SIGNATURES[name]} AS {sql}")
     cur.execute(f"PREPARE ref_article(bigint, text) AS {ARTICLE_BY_SLUG}")
     cur.execute(f"PREPARE article(bigint, bigint, text) AS {ARTICLE}")
     cur.execute(f"PREPARE ref_comments(bigint, text) AS {REFERENCE_COMMENTS}")
@@ -71,14 +80,17 @@ def reference_list(cur, kind, params):
     return cur.fetchone()[0], rows
 
 
-def v2_list(cur, kind, params):
+def v2_list(cur, kind, params, name="v2"):
     # Mirrors the C assembly: index the header facts, then decorate article rows sorted newest first.
-    cur.execute(f"EXECUTE v2_{kind}(%s, %s, %s, %s)", params)
+    cur.execute(f"EXECUTE {name}_{kind}(%s, %s, %s, %s)", params)
     rows = cur.fetchall()
     headers = [row for row in rows if row[0] == 0]
     assert len(headers) == 1, f"{kind}: expected one header row, got {len(headers)}"
     header = headers[0]
-    counts = dict(zip(header[12] or [], header[13] or []))
+    if header[13] is None:  # E7: one article id per favorite, counted here
+        counts = Counter(header[12] or [])
+    else:
+        counts = dict(zip(header[12] or [], header[13] or []))
     favorites, follows, tags = set(header[14] or []), set(header[15] or []), {}
     for article_id, name in zip(header[16] or [], header[17] or []):
         tags.setdefault(article_id, []).append(name)
@@ -87,21 +99,25 @@ def v2_list(cur, kind, params):
                          row[8], row[9], row[10], kind == "feed" or row[2] in follows) for row in articles]
 
 
-def v1_list(cur, kind, params):
-    cur.execute(f"EXECUTE v1_{kind}(%s, %s, %s, %s)", params)
+def v1_list(cur, kind, params, name="v1"):
+    cur.execute(f"EXECUTE {name}_{kind}(%s, %s, %s, %s)", params)
     rows = cur.fetchall()
     return rows[0][0], [(row[1], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], row[12], row[13], row[14]) for row in rows if row[1]]
 
 
-def candidate_comments(cur, viewer, article_id, slug):
-    cur.execute("EXECUTE comments(%s, %s, %s)", (viewer, article_id, slug))
-    rows = cur.fetchall()
+def assemble_comments(rows):
+    # Mirrors the C assembly of COMMENTS rows: no header row means 404; comments sorted newest first.
     header = next((row for row in rows if row[0] == 0), None)
     if not header:
         return None
     follows = set(header[9] or [])
     return [(row[1], row[2], row[3], row[4], row[6], row[7], row[8], row[5] in follows)
             for row in sorted((row for row in rows if row[0] == 1), key=lambda row: (row[3], row[1]), reverse=True)]
+
+
+def candidate_comments(cur, viewer, article_id, slug):
+    cur.execute("EXECUTE comments(%s, %s, %s)", (viewer, article_id, slug))
+    return assemble_comments(cur.fetchall())
 
 
 def reference_comments(cur, viewer, slug):
@@ -136,6 +152,9 @@ def check_reads(cur, rng, rounds):
             expected = reference_list(cur, kind, params)
             report(f"v1 {kind} {params}", expected, v1_list(cur, kind, params))
             report(f"v2 {kind} {params}", expected, v2_list(cur, kind, params))
+            report(f"v1d {kind} {params}", expected, v1_list(cur, kind, params, "v1d"))
+            report(f"v2c {kind} {params}", expected, v2_list(cur, kind, params, "v2c"))
+            report(f"v2t {kind} {params}", expected, v2_list(cur, kind, params, "v2t"))
     cur.execute("SELECT id, slug FROM articles ORDER BY random() LIMIT 60")
     articles = cur.fetchall()
     cur.execute("SELECT id, slug FROM articles WHERE id IN (%s, (SELECT article_id FROM comments GROUP BY 1 ORDER BY count(*) DESC LIMIT 1))", (hot_article,))
@@ -287,6 +306,53 @@ def check_users(conn):
     conn.rollback()
 
 
+def check_batched(cur, rng, rounds=25):
+    # E2: every element of a batched statement gets exactly the rows its own statement returns, including wrong
+    # slugs, missing articles and unknown users, and the same request twice in one batch.
+    cur.execute("SELECT id, slug FROM articles ORDER BY random() LIMIT 30")
+    articles = cur.fetchall()
+    cur.execute("SELECT id, slug FROM articles WHERE id = (SELECT article_id FROM comments GROUP BY 1 ORDER BY count(*) DESC LIMIT 1)")
+    articles += cur.fetchall()
+    viewers = (fetch(cur, "SELECT follower_id FROM follows GROUP BY 1 ORDER BY count(*) DESC LIMIT 3") +
+               fetch(cur, "SELECT id FROM users ORDER BY random() LIMIT 5") + [0])
+    usernames = fetch(cur, "SELECT username FROM users ORDER BY random() LIMIT 10") + ["nobody-zz"]
+    for _ in range(rounds):
+        items = []
+        for _ in range(rng.randint(1, 12)):
+            article_id, slug = rng.choice(articles)
+            r = rng.random()
+            if r < 0.15:
+                slug += "x"
+            elif r < 0.25:
+                article_id, slug = 10 ** 12, "missing-1000000000000"
+            items.append((rng.choice(viewers), article_id, slug))
+        if len(items) > 1 and rng.random() < 0.5:
+            items.append(items[0])
+        vs, ids, slugs = [x[0] for x in items], [x[1] for x in items], [x[2] for x in items]
+        cur.execute("EXECUTE article_b(%s, %s, %s)", (vs, ids, slugs))
+        rows = cur.fetchall()
+        for k, (v, article_id, slug) in enumerate(items, 1):
+            cur.execute("EXECUTE article(%s, %s, %s)", (v, article_id, slug))
+            report(f"article_b element {k}/{len(items)}", [tuple(r) for r in cur.fetchall()], [tuple(r[1:]) for r in rows if r[0] == k])
+        cur.execute("EXECUTE comments_b(%s, %s, %s)", (vs, ids, slugs))
+        rows = cur.fetchall()
+        for k, (v, article_id, slug) in enumerate(items, 1):
+            report(f"comments_b element {k}/{len(items)}", candidate_comments(cur, v, article_id, slug),
+                   assemble_comments([tuple(r[1:]) for r in rows if r[0] == k]))
+        names = [rng.choice(usernames) for _ in items]
+        cur.execute("EXECUTE profile_b(%s, %s)", (vs, names))
+        rows = cur.fetchall()
+        for k, (v, name) in enumerate(zip(vs, names), 1):
+            cur.execute("EXECUTE profile(%s, %s)", (v, name))
+            report(f"profile_b element {k}/{len(items)}", [tuple(r) for r in cur.fetchall()], [tuple(r[1:]) for r in rows if r[0] == k])
+        uids = [rng.choice(viewers + [10 ** 12]) for _ in items]
+        cur.execute("EXECUTE user_get_b(%s)", (uids,))
+        rows = cur.fetchall()
+        for k, uid in enumerate(uids, 1):
+            cur.execute("EXECUTE user_get(%s)", (uid,))
+            report(f"user_get_b element {k}/{len(items)}", [tuple(r) for r in cur.fetchall()], [tuple(r[1:]) for r in rows if r[0] == k])
+
+
 def check_plans(cur):
     # Flags plan shapes that read whole key ranges or whole big tables; the one 200-row scan of tags is expected.
     viewer = fetch(cur, "SELECT follower_id FROM follows GROUP BY 1 ORDER BY count(*) DESC LIMIT 1")[0]
@@ -294,9 +360,13 @@ def check_plans(cur):
     author = fetch(cur, "SELECT username FROM users WHERE id = (SELECT author_id FROM articles GROUP BY 1 ORDER BY count(*) DESC LIMIT 1)")[0]
     cur.execute("SELECT id, slug FROM articles WHERE id = (SELECT article_id FROM comments GROUP BY 1 ORDER BY count(*) DESC LIMIT 1)")
     hot_id, hot_slug = cur.fetchone()
-    samples = [(f"{shape}_{kind}", (viewer, 10, 20, tag if kind == "tag" else author if kind in ("author", "favorited") else None)) for kind in V2 for shape in ("v1", "v2")]
+    samples = [(f"{shape}_{kind}", (viewer, 10, 20, tag if kind == "tag" else author if kind in ("author", "favorited") else None))
+               for kind in V2 for shape in ("v1", "v2", "v1d", "v2c", "v2t")]
     samples += [("article", (viewer, hot_id, hot_slug)), ("comments", (viewer, hot_id, hot_slug)), ("user_get", (viewer,)),
-                ("profile", (viewer, author)), ("tags", ())]
+                ("profile", (viewer, author)), ("tags", ()),
+                ("article_b", ([viewer, 0, viewer], [hot_id, hot_id, 1], [hot_slug, hot_slug, "x-1"])),
+                ("comments_b", ([viewer, 0], [hot_id, 1], [hot_slug, "x-1"])),
+                ("profile_b", ([viewer, 0], [author, "nobody-zz"])), ("user_get_b", ([viewer, 1],))]
     warnings = []
     for name, params in samples:
         cur.execute(f"EXPLAIN (COSTS OFF) EXECUTE {name}{'(' + ', '.join(['%s'] * len(params)) + ')' if params else ''}", params)
@@ -315,6 +385,8 @@ def main():
     prepare(cur)
     conn.commit()
     check_reads(cur, random.Random(seed), int(sys.argv[sys.argv.index("--rounds") + 1]) if "--rounds" in sys.argv else 150)
+    conn.rollback()
+    check_batched(cur, random.Random(seed + 1))
     conn.rollback()
     check_writes(conn)
     check_users(conn)
