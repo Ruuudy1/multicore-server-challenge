@@ -75,9 +75,10 @@ sequential scans of big tables.
 - **No writes to `tags` on the hot path**: an article creation inserts only tag names that don't exist yet.
 - Comments: the article check and the newest 100 comments in one statement; the header row carries the viewer's
   follow set and C computes each comment's `following`.
-- A second list shape (v2: one header row of page facts, gathered with range or `= ANY` scans, plus plain article
-  rows that C joins) is built in and selectable per list kind with `LIST_SHAPE_<KIND>=v2`. It stays off until it
-  measures better on the real box.
+- **Lists as page facts (v2, the default):** one header row carries the page's facts, gathered with a few range
+  (global list: every id between the page's min and max is on it) or `= ANY` scans: favorite counts, the viewer's
+  favorites and follows, and tag names. Plain article rows follow, and C joins them. On an aged database this cut
+  CPU per request 6.1% against per-row decoration (v1), which stays available with `LIST_SHAPE_<KIND>=v1`.
 
 ### bcrypt
 
@@ -160,11 +161,60 @@ Where the CPU goes (`tools/profile.sh`, perf at 9,000 users, about 25,000 req/s)
   code 10 to 12% (about 6 µs per request).
 - bcrypt on one core: 51.6 ms per cost-10 hash one at a time, 18.0 ms with 6 in lockstep (`tests/bcrypt_bench.c`).
 
-Experiments so far (section 8 of the build spec):
+The table and the profile above predate v2 lists (they ran v1).
 
-- **E1, v2 lists:** execution time per call fell 20% (global), 15% (tag), 14% (feed), 3% (author) and 1%
-  (favorited), but Postgres CPU per request did not move (237.5 against 239.2 µs): the larger plans cost more
-  executor startup. v1 stays the default; each kind can switch with `LIST_SHAPE_<KIND>=v2` for the box.
+### The maintainer's search, on this machine
+
+`tools/localsearch.sh` runs `loadgen search` as the maintainer does (3-minute warm-up, 2-minute probes doubling
+then bisected to 5%, 5-minute holds) with its local testing switches: the server as `challenge.service`, Postgres
+and the server on 8 CPUs, the load generator on the other 14, think times and sessions scaled by 0.1, from a fresh
+copy of the full seed. Result (v2 lists, all defaults):
+
+| Phase | Users (x0.1) | req/s | p50 | p95 | p99 | Errors |
+|---|---|---|---|---|---|---|
+| probe | 16,000 | 29,613 | 173 ms | 220 ms | 241 ms | 0 |
+| probe | 20,000 | 27,954 | 353 ms | 401 ms | 427 ms | 0 |
+| probe | 21,000 | 27,994 | 389 ms | 448 ms | 478 ms | 0 |
+| probe | 22,000 | 27,122 | 450 ms | 533 ms (fail) | 568 ms | 0 |
+| **hold, 5 minutes** | **21,000** | **27,241** | 411 ms | **476 ms** | 508 ms | **0 of 8.2 million** |
+
+Not load-generator limited (load box CPU 47%, never behind). Over the hold the server used about 1.8 cores and
+Postgres 6.3, the whole 8. By the closed-loop math of the build spec (users = req/s x (7 s + 1.86 calls x 0.41 s) /
+1.86 calls), 27,241 req/s at this latency is about 113,000 users at the real 7-second think time. That is an
+estimate for 8 threads of a laptop's Core Ultra 9 (hybrid cores, local loopback), not a score for the box: only
+`tools/replica/` on the benchmark hardware gives one.
+
+### Experiments (section 8 of the build spec)
+
+`tools/campaign.sh` runs each comparison as two ABBA cycles (4 paired runs of each variant) at 9,000 users, on one
+database that ages through the campaign (the scored hold runs on an aged database too). Aging is large: midway the
+database had 34% more articles, 23% more comments and 13% more favorites than the seed, and the same v1 server went
+from about 340 µs of CPU per request (during E1) to about 485 µs (the last sweep). `tools/abba.py` gives the paired change
+and a bootstrap 95% interval. The rule: adopt only if CPU per request falls at least 3% with an interval that
+excludes zero and p99 does not regress by more than 10%. All runs on AC power with nothing else on the machine.
+
+| | Change (B against the default A) | CPU per request | p95 / p99 | Decision |
+|---|---|---|---|---|
+| E1 | v2 lists, all kinds | **-6.1%** [-9.2, -3.0] | -40% / -35% | **adopted**: v2 is the default |
+| E2 | point reads grouped per statement (`E2_BATCH=1`) | +1.7% [-0.5, +3.9] | +7% / +11% | rejected |
+| E7 | v2 favorite counts as raw ids counted in C (`v2c`) | -1.4% [-4.0, +0.7] | -8% / -1% | rejected |
+| E8 | v2 tag names by key probes (`v2t`) | -1.8% [-3.3, -0.3] | -20% / -19% | below the bar; first to retry on the box |
+| E9 | gzip of bodies over 4 KB (`GZIP=1` build) | +4.7% [+2.5, +7.7] | +21% / +18% | rejected (on loopback) |
+| E10 | v1 with one `users` look-up per author (`v1d`) | +1.7% [-0.8, +5.1] | | rejected |
+| E5 | `LOOPS` 2 → 1 | -2.4% [-4.9, +0.2] | -16% / -16% | below the bar; retry on the box |
+| E5 | `PG_READ_CONNS` 8 → 12 | +6.5% [-0.1, +16.1] | +54% / +67% | rejected |
+| E5 | `PG_DEPTH` 2 → 4 | -2.7% [-9.2, +3.2] | -3% / +1% | inconclusive; 2 stays |
+| E5 | `READ_BATCH` 24 → 12 | +2.1% [-0.3, +4.9] | +5% / +5% | rejected |
+
+Notes:
+
+- E1 earlier showed no change on a fresh database (Postgres 237.5 against 239.2 µs per request in one run with
+  `pg_stat_statements`); the gain appears as the database ages, which is where the score is measured.
+- E2 matches PR #11's finding: grouping point reads saves per-statement overhead that batching had already made
+  small, and `unnest` costs more than it saves. E9 ran over loopback, where sending is cheap; on the box's virtio
+  NIC it could differ, and it is one build flag away.
+- E2 and E10 ran before the others, partly on battery; the rest re-ran on AC power after the machine slept
+  mid-campaign (the battery runs of E1 gave -7.4%, the same answer).
 - **E3, one snapshot per batch:** dropped without a run, since snapshots are 0.13% of backend CPU
   (`READ_SNAPSHOT=batch` exists).
 - **E6, bcrypt width:** calibrated over 3, 4 and 6 lanes. 8 lanes (34 KB of S-boxes) won on an idle core but not
@@ -174,15 +224,10 @@ Experiments so far (section 8 of the build spec):
 - **E4, completion batching:** single runs at 12,000 users suggested `URING_WAIT_US=500` was 7% cheaper per
   request, but 4 ABBA pairs (`tools/abba.py`) put the change at -0.0%, 95% interval [-2.6%, +2.6%]: the single
   runs had ridden a drift of the machine itself (CPU per request fell from 302 to 252 µs over 25 minutes, whatever
-  the setting). 250 µs stays. Single runs of `LOOPS=1`, `READ_BATCH=12` and `PG_READ_CONNS=12` fell in the same
-  drift and are inconclusive; the defaults stay until ABBA pairs on the box decide (`tools/replica/`).
-- **Built and verified, not yet measured:** E2 (`E2_BATCH=1`: concurrent article, comments, profile and user reads
-  of one statement run as one `unnest ... WITH ORDINALITY` execution, each request answered with only its own
-  rows), E10 (`v1d`: one `users` look-up per author on the page), E7 (`v2c`: favorite counts as raw ids counted in
-  C), E8 (`v2t`: tag names by key probes) and E9 (gzip of bodies over `GZIP_MIN` bytes, in a `GZIP=1` build with
-  libdeflate). Every variant keeps the conformance transcript identical to the reference's, `check.py` finds 0
-  mismatches in 4,949 checks, and E2 and E9 pass the differential test under 32 to 96 concurrent requests (E2
-  also under ASan and UBSan). All are off by default; `tools/campaign.sh` runs their ABBA pairs.
+  the setting). 250 µs stays.
+- **Correctness of the variants:** every one keeps the conformance transcript identical to the reference's,
+  `check.py` finds 0 mismatches in 4,949 checks, and E2 and E9 pass the differential test under 32 to 96 concurrent
+  requests (E2 also under ASan and UBSan), so each stays switchable for A/B work on the box.
 
 ## Rules
 
@@ -215,7 +260,7 @@ the variables exist for local sweeps.
 | `BCRYPT_LANES` | auto | hashes in lockstep (calibrated at startup) |
 | `BCRYPT_WAIT_MS` | 250 | how long a job may wait for its batch to fill |
 | `BCRYPT_NICE` | 5 | nice level of the bcrypt workers |
-| `LIST_SHAPE_GLOBAL`, `_TAG`, `_AUTHOR`, `_FAVORITED`, `_FEED` | v1 | list SQL shape: v1, v2, v1d (E10), v2c (E7), v2t (E8) |
+| `LIST_SHAPE_GLOBAL`, `_TAG`, `_AUTHOR`, `_FAVORITED`, `_FEED` | v2 | list SQL shape: v1, v2, v1d (E10), v2c (E7), v2t (E8) |
 | `E2_BATCH`, `E2_MIN` | 0, 2 | E2: group concurrent point reads of one statement (at least `E2_MIN` of them) |
 | `READ_SNAPSHOT` | statement | `batch`: repeatable read on read connections (E3) |
 | `GZIP_MIN`, `GZIP_LEVEL` | 0, 1 | E9: gzip bodies of at least this many bytes (only in a `GZIP=1` build) |

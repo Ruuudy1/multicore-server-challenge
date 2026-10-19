@@ -7,7 +7,8 @@ APP=$(cg challenge.service); DB=$(cg 'postgresql@18-main.service'); NG=$(cg ngin
 usec() { if [ -n "$1" ] && [ -f "$1/cpu.stat" ]; then awk '/^usage_usec/ {print $2}' "$1/cpu.stat"; else echo 0; fi; }
 sample() { read -r _ u n s i w q sq st _ < /proc/stat; echo "$((u+n+s+i+w+q+sq+st)) $((i+w)) $st $(usec "$APP") $(usec "$DB") $(usec "$NG")"; }
 echo "time,cpu%,steal%,app%,db%,nginx%" > "$2.csv"
-read -ra prev <<< "$(sample)"; wall=$(awk -v i="$1" -v c="$(nproc)" 'BEGIN {print i * c * 1000000}')
+# every online CPU (nproc would count only this process's affinity, e.g. under taskset)
+read -ra prev <<< "$(sample)"; wall=$(awk -v i="$1" -v c="$(getconf _NPROCESSORS_ONLN)" 'BEGIN {print i * c * 1000000}')
 while sleep "$1"; do
   read -ra cur <<< "$(sample)"
   awk -v t="$(date +%s)" -v a="${cur[*]}" -v b="${prev[*]}" -v w="$wall" 'BEGIN {

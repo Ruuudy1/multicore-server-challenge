@@ -21,8 +21,8 @@ run() { # label, then localbench arguments
     | grep '^{' || echo "run $label failed"
 }
 
-compare() { # name, A label, A args, B label, B args
-  local name="$1" al="$2" aa="$3" bl="$4" ba="$5"
+compare() { # name, A label, A args, B label, B args (TAG= appends a suffix to the labels, for reruns)
+  local name="$1" al="$2${TAG:-}" aa="$3" bl="$4${TAG:-}" ba="$5"
   echo "== $name"
   for _ in $(seq "$PAIRS"); do
     # shellcheck disable=SC2086

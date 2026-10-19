@@ -48,7 +48,7 @@ static void load_config(void) {
     static const char *const shapes[] = {"v1", "v2", "v1d", "v2c", "v2t"}; /* SHAPE_* order */
     for (int k = 0; k < K_KINDS; k++) {
         const char *v = getenv(kinds[k]);
-        cfg.list_shape[k] = SHAPE_V1;
+        cfg.list_shape[k] = SHAPE_V2; /* E1: v2 cut CPU per request 6.1% on an aged database (README) */
         if (!v || !*v) continue;
         int s = -1;
         for (int i = 0; i < (int)ARRAY_LEN(shapes); i++) if (!strcmp(v, shapes[i])) s = i;
