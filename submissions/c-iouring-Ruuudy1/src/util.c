@@ -32,7 +32,7 @@ void log_msg(const char *fmt, ...) {
 
 #define POOL_MIN_SHIFT 12   /* 4 KiB */
 #define POOL_CLASSES 11     /* up to 4 MiB */
-#define POOL_KEEP 512       /* free buffers kept per class */
+#define POOL_KEEP(c) ((c) < 9 ? 512u >> (c) : 1u) /* free buffers kept per class: about 2 MiB each */
 
 struct pool_node { struct pool_node *next; };
 static __thread struct { struct pool_node *head[POOL_CLASSES]; uint32_t count[POOL_CLASSES]; } pool;
@@ -65,7 +65,7 @@ char *pool_alloc(uint32_t *cap) {
 void pool_free(char *p, uint32_t cap) {
     if (!p) return;
     int c = pool_class(cap);
-    if (c >= POOL_CLASSES || (1u << (POOL_MIN_SHIFT + c)) != cap || pool.count[c] >= POOL_KEEP) {
+    if (c >= POOL_CLASSES || (1u << (POOL_MIN_SHIFT + c)) != cap || pool.count[c] >= POOL_KEEP(c)) {
         free(p);
         return;
     }

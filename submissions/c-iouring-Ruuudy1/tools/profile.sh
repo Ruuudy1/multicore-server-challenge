@@ -7,7 +7,9 @@ ROOT="${1:?usage: tools/profile.sh <challenge repo> [users]}"
 USERS="${2:-9000}"
 shift 2 || true
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-PERF="${PERF:-$(ls -d /usr/lib/linux-tools/*/perf 2>/dev/null | grep -v microsoft | head -1)}"
+if [ -z "${PERF:-}" ]; then
+  for p in /usr/lib/linux-tools/*/perf; do case "$p" in *microsoft*) ;; *) PERF="$p"; break ;; esac; done
+fi
 OUT="${OUT:-/tmp/profile}"
 mkdir -p "$OUT"
 python3 "$HERE/tools/localbench.py" --repo "$ROOT" --server c --users "$USERS" --warmup 20 --ramp 20 --measure 40 --label profile "$@" &
