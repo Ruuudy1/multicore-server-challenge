@@ -176,6 +176,13 @@ Experiments so far (section 8 of the build spec):
   runs had ridden a drift of the machine itself (CPU per request fell from 302 to 252 µs over 25 minutes, whatever
   the setting). 250 µs stays. Single runs of `LOOPS=1`, `READ_BATCH=12` and `PG_READ_CONNS=12` fell in the same
   drift and are inconclusive; the defaults stay until ABBA pairs on the box decide (`tools/replica/`).
+- **Built and verified, not yet measured:** E2 (`E2_BATCH=1`: concurrent article, comments, profile and user reads
+  of one statement run as one `unnest ... WITH ORDINALITY` execution, each request answered with only its own
+  rows), E10 (`v1d`: one `users` look-up per author on the page), E7 (`v2c`: favorite counts as raw ids counted in
+  C), E8 (`v2t`: tag names by key probes) and E9 (gzip of bodies over `GZIP_MIN` bytes, in a `GZIP=1` build with
+  libdeflate). Every variant keeps the conformance transcript identical to the reference's, `check.py` finds 0
+  mismatches in 4,949 checks, and E2 and E9 pass the differential test under 32 to 96 concurrent requests (E2
+  also under ASan and UBSan). All are off by default; `tools/campaign.sh` runs their ABBA pairs.
 
 ## Rules
 
@@ -208,7 +215,10 @@ the variables exist for local sweeps.
 | `BCRYPT_LANES` | auto | hashes in lockstep (calibrated at startup) |
 | `BCRYPT_WAIT_MS` | 250 | how long a job may wait for its batch to fill |
 | `BCRYPT_NICE` | 5 | nice level of the bcrypt workers |
-| `LIST_SHAPE_GLOBAL`, `_TAG`, `_AUTHOR`, `_FAVORITED`, `_FEED` | v1 | list SQL shape |
+| `LIST_SHAPE_GLOBAL`, `_TAG`, `_AUTHOR`, `_FAVORITED`, `_FEED` | v1 | list SQL shape: v1, v2, v1d (E10), v2c (E7), v2t (E8) |
+| `E2_BATCH`, `E2_MIN` | 0, 2 | E2: group concurrent point reads of one statement (at least `E2_MIN` of them) |
+| `READ_SNAPSHOT` | statement | `batch`: repeatable read on read connections (E3) |
+| `GZIP_MIN`, `GZIP_LEVEL` | 0, 1 | E9: gzip bodies of at least this many bytes (only in a `GZIP=1` build) |
 | `MAX_BODY` | 1048576 | request body limit |
 | `STATS` | 0 | 1 prints one line per loop per second |
 
