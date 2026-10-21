@@ -44,5 +44,10 @@ for exp in ${EXPERIMENTS:-e2 e10 e1 e7 e8 e9 loops conns depth batch}; do
     conns) compare "E5 PG_READ_CONNS" "conns 8" "--server c" "conns 12" "--server c --env PG_READ_CONNS=12" ;;
     depth) compare "E5 PG_DEPTH" "depth 2" "--server c" "depth 4" "--server c --env PG_DEPTH=4" ;;
     batch) compare "E5 READ_BATCH" "batch 24" "--server c" "batch 12" "--server c --env READ_BATCH=12" ;;
+    # E1 per list kind: the default (v2 everywhere) against v1 for that one kind
+    e1-global|e1-tag|e1-author|e1-favorited|e1-feed)
+      kind="${exp#e1-}" var="LIST_SHAPE_$(echo "${exp#e1-}" | tr '[:lower:]' '[:upper:]')"
+      compare "E1 per kind: $kind" "e1 $kind v2" "--server c" "e1 $kind v1" "--server c --env $var=v1" ;;
+    e3) compare "E3 one snapshot per read batch" "e3 statement" "--server c" "e3 batch" "--server c --env READ_SNAPSHOT=batch" ;;
   esac
 done

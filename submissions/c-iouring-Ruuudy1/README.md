@@ -122,8 +122,13 @@ sequential scans of big tables.
   requests; `tests/fuzz.sh` ran 2.4 million libFuzzer inputs against the parsers without a finding.
 - `tests/killtest.sh`: 9 of the server's backends terminated under load, 9 reconnected, 0 failed requests out of
   158,694. `tests/idle.py`: 100,000 keep-alive connections served and then held idle with 50.8 MB of server RSS.
-- The whole server built with ASan and UBSan passes the conformance suite and two minutes of load (8,200 req/s)
-  without a report. Both fallbacks (`NO_BUF_RING=1`, `NO_FIXED_FILES=1`) pass the conformance suite with an
+- `tests/soak.sh` (build spec M8): the server built with ASan and UBSan held **150,000 keep-alive connections for
+  30 minutes** under load (three load generators of 50,000 users, think x6): 11.9 million requests at 6,624 req/s,
+  0 errors, 0 sanitizer reports, 477 MB RSS (with ASan's overhead). It also passes the conformance suite.
+- `tests/groupfail.sh`: a write group with one failing write (a NUL byte Postgres rejects) rolls back and every
+  other write is retried alone: 117 of 117 committed and answered 201. `tests/restarttest.sh`: Postgres restarted
+  under load, 10 connections lost and restored, 1 uncertain write answered 503 out of 158,378 requests.
+- The sanitizer build also ran two minutes of load (8,200 req/s) without a report. Both fallbacks (`NO_BUF_RING=1`, `NO_FIXED_FILES=1`) pass the conformance suite with an
   identical transcript and the edge cases.
 
 ## Measurements (development machine, not the benchmark box)
@@ -184,6 +189,26 @@ Postgres 6.3, the whole 8. By the closed-loop math of the build spec (users = re
 estimate for 8 threads of a laptop's Core Ultra 9 (hybrid cores, local loopback), not a score for the box: only
 `tools/replica/` on the benchmark hardware gives one.
 
+### Against the other entries (build spec M0)
+
+The same search for the strongest open entries, built with their own `install.sh` and `build.sh`, run by their own
+`start.sh` under the same unit settings and defaults, each from a fresh copy of the full seed (`tools/compare.sh`),
+bracketed by this server first and last to show drift (Windows Search was re-indexing in the background, about 3%
+of the machine; the bracket shows it moved nothing). Every one passes the conformance suite here.
+
+| Entry | Score (users held 5 minutes, x0.1) | req/s in the hold | p95 | p99 | Errors |
+|---|---|---|---|---|---|
+| **this one** | **21,000** | 27,331 | 477 ms | 508 ms | 0 |
+| PR #7, Rust + Tokio (Scooter1337) | 19,000 | 27,417 | 462 ms | 536 ms | 0.11% |
+| PR #8, C# Kestrel + Npgsql (XeonFX) | 18,000 | 23,985 | 450 ms | 497 ms | 0 |
+| PR #10, C + io_uring (tigokraft) | 17,000 | 22,104 | 473 ms | 513 ms | 0 |
+| this one again (last) | 21,000 | 27,161 | 482 ms | 512 ms | 0 |
+
+This server holds 10.5% more users than the best of them (PR #7), 16.7% more than PR #8 and 23.5% more than PR #10.
+That is short of the build spec's goal of 25 to 35% over the strongest entry, on this machine. PR #7 moves as many
+requests per second but with a wider latency spread (p50 299 ms against 410 ms, p99 536 against 508 ms), which
+caps its users. The bar on the real box may differ: PR #8 claims 100k users on a GCP c4-highcpu-8.
+
 ### Experiments (section 8 of the build spec)
 
 `tools/campaign.sh` runs each comparison as two ABBA cycles (4 paired runs of each variant) at 9,000 users, on one
@@ -205,6 +230,12 @@ excludes zero and p99 does not regress by more than 10%. All runs on AC power wi
 | E5 | `PG_READ_CONNS` 8 → 12 | +6.5% [-0.1, +16.1] | +54% / +67% | rejected |
 | E5 | `PG_DEPTH` 2 → 4 | -2.7% [-9.2, +3.2] | -3% / +1% | inconclusive; 2 stays |
 | E5 | `READ_BATCH` 24 → 12 | +2.1% [-0.3, +4.9] | +5% / +5% | rejected |
+| E1 per kind | v1 again for the global list only | +0.5% [-0.8, +1.8] | / -7% | v2 stays |
+| E1 per kind | v1 for the tag list only | +1.0% [-0.8, +2.2] | / +5% | v2 stays |
+| E1 per kind | v1 for the author list only | -0.3% [-1.0, +0.9] | / +2% | v2 stays |
+| E1 per kind | v1 for the favorited list only | -0.0% [-1.1, +1.6] | / +5% | v2 stays |
+| E1 per kind | v1 for the feed only | +1.1% [-1.4, +3.3] | / +30% | v2 stays |
+| E3 | one snapshot per read batch (`READ_SNAPSHOT=batch`) | -1.8% [-6.6, +1.8] | / -13% | rejected |
 
 Notes:
 
@@ -215,8 +246,10 @@ Notes:
   NIC it could differ, and it is one build flag away.
 - E2 and E10 ran before the others, partly on battery; the rest re-ran on AC power after the machine slept
   mid-campaign (the battery runs of E1 gave -7.4%, the same answer).
-- **E3, one snapshot per batch:** dropped without a run, since snapshots are 0.13% of backend CPU
-  (`READ_SNAPSHOT=batch` exists).
+- E1 per kind and E3 ran later, on a fresh copy of the seed that aged during those 12 comparisons. No single kind
+  costs more under v2 (each kind is a fraction of the requests, so its share of E1's 6.1% is within noise), and the
+  feed's p99 is clearly better under v2, so v2 stays the default everywhere. E3 matches the profile: snapshots are
+  0.13% of backend CPU, so taking one per batch cannot save much.
 - **E6, bcrypt width:** calibrated over 3, 4 and 6 lanes. 8 lanes (34 KB of S-boxes) won on an idle core but not
   under load, when Postgres shares the core.
 - **Fallbacks:** multishot poll + `recv()` (`NO_BUF_RING=1`) measured within noise of the buffer ring (25,206 req/s,
