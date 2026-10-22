@@ -1,0 +1,8 @@
+bin/
+tests/bin/
+tests/corpus/
+tests/bench-results.jsonl
+crash-*
+leak-*
+timeout-*
+__pycache__/
