@@ -15,6 +15,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -158,6 +159,12 @@ def main():
         cmd = [os.path.join(args.repo, "examples", "go", "bin", "conduit")]
     else:
         cmd = shlex.split(args.cmd)
+    # a stale server on the port would share it (the C server sets SO_REUSEPORT) and take part of the load
+    try:
+        socket.create_connection(("127.0.0.1", args.port), timeout=2).close()
+        sys.exit(f"something already answers on port {args.port} (a stale server?)")
+    except OSError:
+        pass
     log = open(f"/tmp/localbench-{db}.log", "w")
     srv = subprocess.Popen(["taskset", "-c", args.cpus] + cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     try:

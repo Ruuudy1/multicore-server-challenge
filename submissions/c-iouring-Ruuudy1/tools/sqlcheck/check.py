@@ -10,7 +10,7 @@ import psycopg2
 from collections import Counter
 
 from statements import (ARTICLE, ARTICLE_BY_SLUG, BATCHED, BATCHED_SIGNATURES, COMMENTS, FULL_SELECT, REFERENCE, REFERENCE_COMMENTS,
-                        REFERENCE_USERS, SIGNATURES, USER_SIGNATURES, USERS, V1, V1D, V2, V2C, V2T, WRITES)
+                        REFERENCE_USERS, SHARED, SHARED_SIGNATURE, SIGNATURES, USER_SIGNATURES, USERS, V1, V1D, V2, V2C, V2T, WRITES)
 
 # Experiment variants of the list statements, checked like v1 and v2 (statements.py: E10, E7, E8).
 VARIANTS = {"v1d": V1D, "v2c": V2C, "v2t": V2T}
@@ -61,6 +61,8 @@ def prepare(cur):
             cur.execute(f"PREPARE {variant}_{kind}(bigint, int, int, text) AS {sqls[kind]}")
     for name, sql in BATCHED.items():
         cur.execute(f"PREPARE {name}{BATCHED_SIGNATURES[name]} AS {sql}")
+    for kind, sql in SHARED.items():
+        cur.execute(f"PREPARE ls_{kind}{SHARED_SIGNATURE} AS {sql}")
     cur.execute(f"PREPARE ref_article(bigint, text) AS {ARTICLE_BY_SLUG}")
     cur.execute(f"PREPARE article(bigint, bigint, text) AS {ARTICLE}")
     cur.execute(f"PREPARE ref_comments(bigint, text) AS {REFERENCE_COMMENTS}")
@@ -80,23 +82,43 @@ def reference_list(cur, kind, params):
     return cur.fetchone()[0], rows
 
 
+def assemble_v2(kind, header, facts, articles):
+    # Mirrors the C assembly: index the facts, then decorate article rows sorted newest first.
+    if facts[13] is None:  # E7: one article id per favorite, counted here
+        counts = Counter(facts[12] or [])
+    else:
+        counts = dict(zip(facts[12] or [], facts[13] or []))
+    favorites, follows, tags = set(header[14] or []), set(header[15] or []), {}
+    for article_id, name in zip(facts[16] or [], facts[17] or []):
+        tags.setdefault(article_id, []).append(name)
+    articles = sorted(articles, key=lambda row: -row[1])
+    return header[11], [(row[1], row[3], row[4], row[5], row[6], row[7], tags.get(row[1], []), counts.get(row[1], 0), row[1] in favorites,
+                         row[8], row[9], row[10], kind == "feed" or row[2] in follows) for row in articles]
+
+
 def v2_list(cur, kind, params, name="v2"):
-    # Mirrors the C assembly: index the header facts, then decorate article rows sorted newest first.
     cur.execute(f"EXECUTE {name}_{kind}(%s, %s, %s, %s)", params)
     rows = cur.fetchall()
     headers = [row for row in rows if row[0] == 0]
     assert len(headers) == 1, f"{kind}: expected one header row, got {len(headers)}"
-    header = headers[0]
-    if header[13] is None:  # E7: one article id per favorite, counted here
-        counts = Counter(header[12] or [])
-    else:
-        counts = dict(zip(header[12] or [], header[13] or []))
-    favorites, follows, tags = set(header[14] or []), set(header[15] or []), {}
-    for article_id, name in zip(header[16] or [], header[17] or []):
-        tags.setdefault(article_id, []).append(name)
-    articles = sorted((row for row in rows if row[0] == 1), key=lambda row: -row[1])
-    return header[11], [(row[1], row[3], row[4], row[5], row[6], row[7], tags.get(row[1], []), counts.get(row[1], 0), row[1] in favorites,
-                         row[8], row[9], row[10], kind == "feed" or row[2] in follows) for row in articles]
+    return assemble_v2(kind, headers[0], headers[0], [row for row in rows if row[0] == 1])
+
+
+def shared_lists(cur, kind, requests):
+    # Mirrors the C split of a shared execution: request k's header row, the one facts row, and the shared article
+    # rows of request k's own page.
+    cur.execute(f"EXECUTE ls_{kind}(%s, %s, %s, %s)", tuple(list(column) for column in zip(*requests)))
+    rows = cur.fetchall()
+    facts = [row for row in rows if row[0] == 2]
+    assert len(facts) == 1, f"{kind}: expected one facts row, got {len(facts)}"
+    articles = {row[1]: row for row in rows if row[0] == 1}
+    results = []
+    for k in range(1, len(requests) + 1):
+        headers = [row for row in rows if row[0] == 0 and row[18] == k]
+        assert len(headers) == 1, f"{kind}: expected one header row for request {k}, got {len(headers)}"
+        page = [articles[i] for i in headers[0][19] if i in articles]
+        results.append(assemble_v2(kind, headers[0], facts[0], page))
+    return results
 
 
 def v1_list(cur, kind, params, name="v1"):
@@ -353,6 +375,29 @@ def check_batched(cur, rng, rounds=25):
             report(f"user_get_b element {k}/{len(items)}", [tuple(r) for r in cur.fetchall()], [tuple(r[1:]) for r in rows if r[0] == k])
 
 
+def check_shared(cur, rng, rounds=25):
+    # Shared lists: every request of a shared execution gets exactly the reference result, with repeated pages,
+    # repeated filters, different viewers on the same page, unknown tags and users, and deep offsets in one batch.
+    viewers = (fetch(cur, "SELECT follower_id FROM follows GROUP BY 1 ORDER BY count(*) DESC LIMIT 3") +
+               fetch(cur, "SELECT user_id FROM favorites GROUP BY 1 ORDER BY count(*) DESC LIMIT 2") +
+               fetch(cur, "SELECT id FROM users ORDER BY random() LIMIT 5") + [0])
+    filters = {"global": [None],
+               "tag": fetch(cur, "SELECT name FROM tags ORDER BY random() LIMIT 4") + ["missing-zz"],
+               "author": fetch(cur, "SELECT username FROM users WHERE id IN (SELECT author_id FROM articles GROUP BY 1 ORDER BY count(*) DESC LIMIT 3)") +
+                         fetch(cur, "SELECT username FROM users ORDER BY random() LIMIT 2") + ["nobody-zz"],
+               "favorited": fetch(cur, "SELECT username FROM users WHERE id IN (SELECT user_id FROM favorites GROUP BY 1 ORDER BY count(*) DESC LIMIT 3)") +
+                            fetch(cur, "SELECT username FROM users ORDER BY random() LIMIT 2") + ["nobody-zz"]}
+    for kind in SHARED:
+        for _ in range(rounds):
+            requests = [(rng.choice(viewers), rng.choice([5, 10, 10, 10, 20, 100]), rng.choice([0, 0, 0, 10, 20, 30, 40, 5000]),
+                         rng.choice(filters[kind])) for _ in range(rng.randint(1, 16))]
+            if rng.random() < 0.5:  # the same page for other viewers
+                requests += [(rng.choice(viewers),) + requests[0][1:] for _ in range(rng.randint(1, 4))]
+            rng.shuffle(requests)
+            for k, (request, actual) in enumerate(zip(requests, shared_lists(cur, kind, requests)), 1):
+                report(f"ls {kind} request {k}/{len(requests)} {request}", reference_list(cur, kind, request), actual)
+
+
 def check_plans(cur):
     # Flags plan shapes that read whole key ranges or whole big tables; the one 200-row scan of tags is expected.
     viewer = fetch(cur, "SELECT follower_id FROM follows GROUP BY 1 ORDER BY count(*) DESC LIMIT 1")[0]
@@ -367,6 +412,8 @@ def check_plans(cur):
                 ("article_b", ([viewer, 0, viewer], [hot_id, hot_id, 1], [hot_slug, hot_slug, "x-1"])),
                 ("comments_b", ([viewer, 0], [hot_id, 1], [hot_slug, "x-1"])),
                 ("profile_b", ([viewer, 0], [author, "nobody-zz"])), ("user_get_b", ([viewer, 1],))]
+    samples += [(f"ls_{kind}", ([viewer, 0, viewer], [10, 10, 5], [0, 0, 20],
+                                [tag if kind == "tag" else author if kind in ("author", "favorited") else None] * 3)) for kind in SHARED]
     warnings = []
     for name, params in samples:
         cur.execute(f"EXPLAIN (COSTS OFF) EXECUTE {name}{'(' + ', '.join(['%s'] * len(params)) + ')' if params else ''}", params)
@@ -387,6 +434,8 @@ def main():
     check_reads(cur, random.Random(seed), int(sys.argv[sys.argv.index("--rounds") + 1]) if "--rounds" in sys.argv else 150)
     conn.rollback()
     check_batched(cur, random.Random(seed + 1))
+    conn.rollback()
+    check_shared(cur, random.Random(seed + 2))
     conn.rollback()
     check_writes(conn)
     check_users(conn)

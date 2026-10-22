@@ -45,6 +45,13 @@ tries to cost Postgres as little as possible, then to cost as little as possible
   `READ_BATCH` (24) queued requests, encodes them back to back (Bind + Execute each) with one Sync, and sends
   them in one write. Each request is answered at its own CommandComplete, not at the end of the batch. If a
   statement fails, Postgres skips the rest of its batch; those requests go back to the head of the FIFO.
+- **Shared executions** (items 1 to 3, after PR #7): requests already queued when a batch is formed can share one
+  execution. Every `GET /api/tags` in the batch is answered from one execution of the tag list. Global, tag, author
+  and favorited list requests of one kind (at least `SHARE_MIN`, 2) become one statement over arrays of viewers,
+  limits, offsets and filters; C splits its rows into each request's page. A batch holding a shareable request also
+  takes up to `READ_GATHER` (64) queued requests of the same kind from further back in the FIFO. Every response
+  still comes from an execution sent after its request arrived, and nothing is kept for later requests. Feeds
+  stay per request.
 - **Writes**: group commit. While a group's commit is in flight, writes queue up; the next group (up to
   `WRITE_BATCH`, 128) is one implicit transaction with one Sync, and every response in it waits for
   ReadyForQuery, so writes are committed before the response. If anything in a group fails, the group rolled
@@ -81,6 +88,11 @@ sequential scans of big tables.
   follows, and tag names. Plain article rows follow, and C joins them. On an aged database this cut CPU per request
   6.1% against per-row decoration (v1). The default (`v2t`) looks the tag names up by primary key instead of
   hash-joining `tags`; the other shapes stay available with `LIST_SHAPE_<KIND>=v1|v2|...`.
+- **Shared lists** (`ls_<kind>`): the requests' arrays are `unnest`ed `WITH ORDINALITY`; each distinct filter is
+  resolved and counted once, each distinct page (limit, offset, filter) is read once, and the facts (favorite
+  counts, tag names by key probes) are gathered once for all the pages' articles. The rows are one header per
+  request (its position, page ids and count, its viewer's favorites and follows), one facts row, and each distinct
+  article once.
 
 ### bcrypt
 
@@ -115,11 +127,18 @@ sequential scans of big tables.
 - `tools/diffcheck.sh`: 3,000 random read requests each on the dev and the full seed (all list filters, deep
   offsets, feeds, articles, comments, profiles, users, bad parameters and tokens) against the Go example on the
   same database: 0 differences.
-- `tools/sqlcheck/check.py` on PostgreSQL 18.6, every list shape (v1, v2, v2t, v1d, v2c) and the batched E2
-  statements: 4,949 checks and 0 mismatches each on the dev seed and on the edge-case dataset, 1,699 checks and 0
-  mismatches on the full seed (20 rounds), 0 plan warnings.
+- `tools/sqlcheck/check.py` on PostgreSQL 18.6, every list shape (v1, v2, v2t, v1d, v2c), the batched E2
+  statements and the shared lists (each request's page assembled from the shared rows and compared with the
+  reference SQL run alone, over groups with repeated requests, missing tags and users, and offsets up to 5,000):
+  5,986 checks and 0 mismatches each on the dev seed and on the edge-case dataset, 2,736 checks and 0 mismatches
+  on the full seed (20 rounds), 0 plan warnings.
 - With the final defaults (one loop, `v2t` lists): conformance 197/197 on the dev and the full seed, transcript
   identical, edge cases clean, and 0 differences from the Go example in 4,000 reads at 32 concurrent requests.
+- Shared executions: the transcript stays identical with shared lists forced onto every list read (`SHARE_MIN=1`), also under
+  ASan and UBSan. The differential test at 64 concurrent requests found 0 differences on the dev and the full seed
+  with the defaults (615 of 3,000 full-seed reads answered by shared executions) and with one read connection at
+  depth 1 (`PG_READ_CONNS=1 PG_DEPTH=1`: 1,136 shared), and 0 differences and no sanitizer report under ASan and
+  UBSan (482 shared).
 - `tests/run.sh`: 490 unit checks (SHA-256 against FIPS vectors with and without SHA-NI, HMAC against RFC 4231,
   PBKDF2 against RFC 7914, base64url, the JSON parser, JWT acceptance and rejection, bcrypt, timestamps, slugify,
   the HTTP parser), also under ASan and UBSan. `tests/edge.sh` (27 checks) covers pipelining, split requests,
@@ -226,7 +245,8 @@ bracketed against the strongest entry in one later session:
 **+11.1% over the strongest entry**, the same margin as before on a slower day (this laptop's absolute numbers
 move about 10% between days, so only same-session runs are compared). Still short of the build spec's 25 to 35%:
 the two servers move the same requests per second, and the remaining gap is mostly Postgres work per request, which
-the experiments above have mostly exhausted on this machine.
+the experiments above have mostly exhausted on this machine. Shared executions (below) since closed that gap:
+27,000 users against PR #7's 20,000, **+35%**.
 
 ### Experiments (section 8 of the build spec)
 
@@ -300,10 +320,48 @@ Notes:
   `check.py` finds 0 mismatches in 4,949 checks, and E2 and E9 pass the differential test under 32 to 96 concurrent
   requests (E2 also under ASan and UBSan), so each stays switchable for A/B work on the box.
 
+### Shared executions (items 1 to 3, after PR #7)
+
+The same campaign method at 16,000 users (just under the knee without sharing), three ABBA cycles (6 pairs)
+per comparison on a fresh copy of the full seed that aged through the campaign:
+
+| | Change (B against A) | CPU per request | req/s | p95 / p99 | Decision |
+|---|---|---|---|---|---|
+| Items 1 to 3 | all three against none | **-23.8%** [-24.8, -22.7] | +29.5% | -74% / -69% | **adopted** |
+| Item 2 | shared lists alone | -7.5% [-8.8, -6.1] | +7.4% | -22% / -20% | adopted |
+| Item 3 | gathering (`READ_GATHER=64`), with items 1 and 2 on | -15.2% [-17.0, -13.4] | +17.6% | -43% / -39% | adopted |
+| Item 1 | shared tag list, with items 2 and 3 on | -4.4% [-8.5, -0.1] | +4.9% | -10% / -7% | adopted |
+| Item 1 | shared tag list alone | -1.9% [-5.1, +1.5] | +2.0% | -4% / -1% | (needs gathering) |
+
+Gathering is what makes sharing pay: a batch of 24 holds few requests of one list kind, while the queue behind it
+holds many. With all three, the server runs at 39,700 req/s against 30,600 at the same 16,000 users, and p95 falls
+from 189 to 50 ms: 16,000 users is now well below the knee.
+
+The maintainer's search (`tools/compare.sh`), each run from a fresh copy of the full seed, in one session:
+
+| Run | Users held 5 minutes (x0.1) | req/s in the hold | p95 | p99 | Errors |
+|---|---|---|---|---|---|
+| **shared executions (the defaults)** | **27,000** | 34,352 | 475 ms | 503 ms | 0 |
+| no sharing (`TAG_SHARE=0 LIST_SHARE=0 READ_GATHER=0`) | 22,000 | 28,150 | 466 ms | 486 ms | 0 |
+| PR #7, Rust + Tokio, its own defaults | 20,000 | 29,086 | 450 ms | 528 ms | 0.14% |
+| shared executions again | **27,000** | 34,391 | 474 ms | 495 ms | 0 |
+
+Sharing holds 22.7% more users than the same server without it, and **35% more than PR #7** (the build spec's goal
+was 25 to 35% over the strongest entry). In the hold the server used about 2.1 cores and Postgres about 5.6 (9% and
+26% of the machine's 22 CPUs) at 34,400 req/s.
+
+The first run of the campaign above was discarded: a server left
+behind by an aborted launch was still listening on the port (`SO_REUSEPORT` let both bind) and took about half of
+every run's connections. `tools/localbench.py` and `tools/localsearch.sh` now refuse to start when anything answers
+on the port.
+
 ## Rules
 
-- Every response is built from statements executed for that request; only connections, prepared statements,
-  the HMAC key schedule and the bcrypt calibration persist. Identical concurrent reads are not coalesced.
+- Every response is built from statements sent after its request arrived, for that request or for a group of
+  queued requests that includes it (shared executions); only connections, prepared statements, the HMAC key
+  schedule and the bcrypt calibration persist. The build spec asks for the maintainer's written OK before
+  coalescing concurrent reads; PR #7, merged and scored, shares executions of queued reads the same way.
+  `TAG_SHARE=0 LIST_SHARE=0` turns sharing off.
 - Writes are committed before the response (group commit answers at ReadyForQuery); an uncertain commit is never
   retried.
 - bcrypt cost 10 every time; JWT signature and `exp` verified on every request; HS256 only.
@@ -333,6 +391,9 @@ the variables exist for local sweeps.
 | `BCRYPT_NICE` | 5 | nice level of the bcrypt workers |
 | `LIST_SHAPE_GLOBAL`, `_TAG`, `_AUTHOR`, `_FAVORITED`, `_FEED` | v2t | list SQL shape: v1, v2, v1d (E10), v2c (E7), v2t (E8) |
 | `E2_BATCH`, `E2_MIN` | 0, 2 | E2: group concurrent point reads of one statement (at least `E2_MIN` of them) |
+| `TAG_SHARE` | 1 | item 1: queued tag list requests share one execution |
+| `LIST_SHARE`, `SHARE_MIN` | 1, 2 | item 2: queued list requests of one kind (not feeds) share one execution, from `SHARE_MIN` of them |
+| `READ_GATHER` | 64 | item 3: queued requests a batch may also take from further back to share an execution (0: none) |
 | `READ_SNAPSHOT` | statement | `batch`: repeatable read on read connections (E3) |
 | `GZIP_MIN`, `GZIP_LEVEL` | 0, 1 | E9: gzip bodies of at least this many bytes (only in a `GZIP=1` build) |
 | `MAX_BODY` | 1048576 | request body limit |

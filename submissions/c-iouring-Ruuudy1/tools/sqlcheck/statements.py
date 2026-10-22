@@ -82,23 +82,28 @@ HEADER_COLUMNS = ("0 AS k, NULL::bigint AS id, NULL::bigint AS author_id, NULL::
                   "NULL::text AS username, NULL::text AS bio, NULL::text AS image")
 
 
-def header_facts(kind, match, counts="group", tags="hash"):
-    # match(column) restricts favorites and article_tags rows to this page's article ids.
-    # counts="raw" (E7): fc.ids lists the article id of every favorite on the page and fc.cnts is NULL; C counts them.
-    # tags="probe" (E8): tag names by primary-key probes instead of a hash join on tags.
+def favorite_counts(match, counts="group"):
+    # match(column) restricts favorites rows to the page's article ids.
+    # counts="raw" (E7): ids lists the article id of every favorite on the page and cnts is NULL; C counts them.
     if counts == "group":
-        fc = (f"SELECT array_agg(g.article_id ORDER BY g.article_id) AS ids, array_agg(g.n ORDER BY g.article_id) AS cnts\n"
-              f"                       FROM (SELECT f.article_id, count(*) AS n FROM favorites f WHERE {match('f.article_id')} GROUP BY f.article_id) g")
-    else:
-        fc = f"SELECT ARRAY(SELECT f.article_id FROM favorites f WHERE {match('f.article_id')}) AS ids, NULL::bigint[] AS cnts"
+        return (f"SELECT array_agg(g.article_id ORDER BY g.article_id) AS ids, array_agg(g.n ORDER BY g.article_id) AS cnts\n"
+                f"                       FROM (SELECT f.article_id, count(*) AS n FROM favorites f WHERE {match('f.article_id')} GROUP BY f.article_id) g")
+    return f"SELECT ARRAY(SELECT f.article_id FROM favorites f WHERE {match('f.article_id')}) AS ids, NULL::bigint[] AS cnts"
+
+
+def tag_names(match, tags="hash"):
+    # (article id, tag name) pairs ordered by name. tags="probe" (E8): names by primary-key probes instead of a hash join on tags.
     if tags == "hash":
-        tg = ("SELECT array_agg(at.article_id ORDER BY t.name, at.article_id) AS aids, array_agg(t.name ORDER BY t.name, at.article_id) AS names\n"
-              f"                       FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE {match('at.article_id')}")
-    else:
-        tg = ("SELECT array_agg(x.article_id ORDER BY x.name, x.article_id) AS aids, array_agg(x.name ORDER BY x.name, x.article_id) AS names "
-              "FROM (SELECT at.article_id, t.name FROM article_tags at "
-              "CROSS JOIN LATERAL (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id OFFSET 0) t "
-              f"WHERE {match('at.article_id')}) x")
+        return ("SELECT array_agg(at.article_id ORDER BY t.name, at.article_id) AS aids, array_agg(t.name ORDER BY t.name, at.article_id) AS names\n"
+                f"                       FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE {match('at.article_id')}")
+    return ("SELECT array_agg(x.article_id ORDER BY x.name, x.article_id) AS aids, array_agg(x.name ORDER BY x.name, x.article_id) AS names "
+            "FROM (SELECT at.article_id, t.name FROM article_tags at "
+            "CROSS JOIN LATERAL (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id OFFSET 0) t "
+            f"WHERE {match('at.article_id')}) x")
+
+
+def header_facts(kind, match, counts="group", tags="hash"):
+    fc, tg = favorite_counts(match, counts), tag_names(match, tags)
     return f"""SELECT {HEADER_COLUMNS},
        {COUNTS[kind]} AS n, fc.ids, fc.cnts,
        ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = $1 AND {match('f.article_id')}) AS my_favs,
@@ -141,6 +146,47 @@ V2 = {kind: header_list(kind) for kind in PAGES}
 V1D = {kind: per_row_list_dedup(kind) for kind in PAGES}                 # E10
 V2C = {kind: header_list(kind, counts="raw") for kind in PAGES}          # E7
 V2T = {kind: header_list(kind, tags="probe") for kind in PAGES}          # E8
+
+# Shared lists (after PR #7): one execution answers several list requests of one kind. The feed is left out: its
+# pages depend on the viewer. Element k of the arrays is request k (ord from 1): $1 viewer, $2 limit, $3 offset,
+# $4 filter. Each distinct filter is looked up and counted once (fn), each distinct page is read once (pg), and each
+# distinct article on those pages is read once (k = 1) with its favorites count and tag names in one facts row
+# (k = 2). Each request's own header row (k = 0) carries its count, its page's ids and its viewer's favorites and
+# follows. C rebuilds every request's v2 result from these rows (api_articles.c).
+SHARED_REQUESTS = "unnest($1::bigint[], $2::int[], $3::int[], $4::text[]) WITH ORDINALITY AS r(viewer, lim, off, filter, ord)"
+FILTER_IDS = {"global": "NULL::bigint", "tag": "(SELECT t.id FROM tags t WHERE t.name = fv.filter)",
+              "author": "(SELECT au.id FROM users au WHERE au.username = fv.filter)",
+              "favorited": "(SELECT fu.id FROM users fu WHERE fu.username = fv.filter)"}
+
+
+def shared_list(kind):
+    def by_filter(sql, alias):
+        for lookup in (TAG_ID, AUTHOR_ID, FAN_ID):
+            sql = sql.replace(lookup, f"{alias}.fid")
+        return sql
+    match = lambda column: f"{column} = ANY(s.ids)"  # noqa: E731
+    return ("WITH r AS MATERIALIZED (SELECT * FROM " + SHARED_REQUESTS + "), "
+            f"fi AS MATERIALIZED (SELECT fv.filter, {FILTER_IDS[kind]} AS fid FROM (SELECT DISTINCT filter FROM r) fv), "
+            f"fn AS MATERIALIZED (SELECT fi.filter, fi.fid, {by_filter(COUNTS[kind], 'fi')} AS n FROM fi), "
+            "pk AS MATERIALIZED (SELECT DISTINCT lim, off, filter FROM r), "
+            f"pg AS MATERIALIZED (SELECT pk.lim, pk.off, pk.filter, fn.n, ARRAY(SELECT b.id FROM ({by_filter(PAGES[kind], 'fn').replace('$3', 'pk.off')}) b "
+            "LIMIT pk.lim) AS ids FROM pk JOIN fn ON fn.filter IS NOT DISTINCT FROM pk.filter), "
+            "ids AS MATERIALIZED (SELECT DISTINCT p.id FROM pg CROSS JOIN LATERAL unnest(pg.ids) AS p(id)), "
+            "s AS MATERIALIZED (SELECT coalesce(array_agg(id), '{}') AS ids FROM ids) "
+            f"SELECT {HEADER_COLUMNS}, pg.n, NULL::bigint[] AS fc_ids, NULL::bigint[] AS fc_cnts, "
+            "ARRAY(SELECT fa.article_id FROM favorites fa WHERE fa.user_id = r.viewer AND fa.article_id = ANY(pg.ids)) AS my_favs, "
+            "ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer) AS my_follows, "
+            "NULL::bigint[] AS tg_aids, NULL::text[] AS tg_names, r.ord, pg.ids AS page "
+            "FROM r JOIN pg ON pg.lim = r.lim AND pg.off = r.off AND pg.filter IS NOT DISTINCT FROM r.filter "
+            "UNION ALL SELECT 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, fc.ids, fc.cnts, NULL, NULL, tg.aids, tg.names, NULL, NULL "
+            f"FROM s LEFT JOIN LATERAL ({favorite_counts(match)}) fc ON true LEFT JOIN LATERAL ({tag_names(match, 'probe')}) tg ON true "
+            "UNION ALL SELECT 1, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, u.username, u.bio, u.image, "
+            "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL "
+            "FROM ids JOIN articles a ON a.id = ids.id CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = a.author_id OFFSET 0) u")
+
+
+SHARED = {kind: shared_list(kind) for kind in PAGES if kind != "feed"}
+SHARED_SIGNATURE = "(bigint[], int[], int[], text[])"
 
 # $2 is the id parsed from the slug's trailing "-<id>"; COLLATE "C" stops the planner from preferring the slug index.
 ARTICLE = """SELECT a.title, a.description, a.body, a.created_at, a.updated_at,

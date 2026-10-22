@@ -30,6 +30,10 @@ struct config {
     int list_shape[K_KINDS]; /* SHAPE_*: the list SQL per kind */
     int read_snapshot;       /* 1: read connections use repeatable read (one snapshot per batch) */
     int e2_batch, e2_min;    /* E2: group concurrent point reads of one statement into one execution */
+    int tag_share;           /* item 1: one execution of the tag list answers every tag list request in a batch */
+    int list_share;          /* item 2: one execution answers a batch's v2 list requests of one kind */
+    int share_min;           /* item 2: requests needed for a shared list execution (1 forces it, for tests) */
+    int gather;              /* item 3: extra queued requests a batch may take to grow its shared executions */
     int gzip_min, gzip_level;/* E9: gzip JSON bodies of at least gzip_min bytes (0 = off; needs a GZIP=1 build) */
     int stats;
     uint32_t max_header, max_body;
@@ -137,6 +141,7 @@ enum stmt_id {
     S_L2C_GLOBAL, S_L2C_TAG, S_L2C_AUTHOR, S_L2C_FAVORITED, S_L2C_FEED,   /* E7: v2, favorites counted in C */
     S_L2T_GLOBAL, S_L2T_TAG, S_L2T_AUTHOR, S_L2T_FAVORITED, S_L2T_FEED,   /* E8: v2, tag names by key probes */
     S_A_GET_B, S_C_LIST_B, S_P_GET_B, S_U_GET_B,                          /* E2: batched point reads */
+    S_LS_GLOBAL, S_LS_TAG, S_LS_AUTHOR, S_LS_FAVORITED,                   /* item 2: shared lists */
     S_FIRST_WRITE,
     S_U_REGISTER = S_FIRST_WRITE, S_U_UPDATE, S_P_FOLLOW, S_P_UNFOLLOW, S_C_ADD, S_C_DEL, S_F_ADD, S_F_DEL,
     S_A_ADD, S_A_PUT, S_A_DEL,
@@ -153,8 +158,8 @@ struct stmt {
 extern const struct stmt STMTS[S_COUNT];
 static inline bool stmt_is_write(int s) { return s >= S_FIRST_WRITE; }
 
-enum { OID_BOOL = 16, OID_INT8 = 20, OID_INT4 = 23, OID_TEXT = 25, OID_INT8_ARRAY = 1016, OID_TEXT_ARRAY = 1009,
-       OID_TIMESTAMPTZ = 1184 };
+enum { OID_BOOL = 16, OID_INT8 = 20, OID_INT4 = 23, OID_TEXT = 25, OID_INT4_ARRAY = 1007, OID_INT8_ARRAY = 1016,
+       OID_TEXT_ARRAY = 1009, OID_TIMESTAMPTZ = 1184 };
 
 /* ---------- query results ---------- */
 
@@ -328,6 +333,18 @@ void api_bcrypt_done(struct req *r);   /* a bcrypt job finished (loop thread) */
 
 /* Shared renderers (api_articles.c). */
 void render_profile(obuf_t *b, str_t username, str_t bio, str_t image, bool following);
+
+/* Item 2: splitting a shared list execution into each request's own v2 result (api_articles.c). share_index runs
+ * once per execution; share_view then gives request ord (its position, from 1) a view of the rows its own v2
+ * statement would have returned, valid until the next share_view. */
+struct share_ix {
+    struct { int64_t id; uint32_t row; } *a;   /* article rows by id */
+    uint32_t n, cap, facts;
+    uint32_t hdr[256];                         /* header row of each request position */
+    struct pgval *v; uint32_t vcap;            /* the current view */
+};
+void share_index(struct share_ix *x, const struct pgres *res);
+bool share_view(struct share_ix *x, const struct pgres *res, int64_t ord, struct pgres *view);
 
 /* ---------- event loop (loop.c) ---------- */
 

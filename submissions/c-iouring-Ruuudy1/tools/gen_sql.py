@@ -27,7 +27,7 @@ CATALOG = [
     ("C_LIST_B", S.BATCHED["comments_b"], S.BATCHED_SIGNATURES["comments_b"]),
     ("P_GET_B", S.BATCHED["profile_b"], S.BATCHED_SIGNATURES["profile_b"]),
     ("U_GET_B", S.BATCHED["user_get_b"], S.BATCHED_SIGNATURES["user_get_b"]),
-] + [
+] + [(f"LS_{c}", S.SHARED[k], S.SHARED_SIGNATURE) for c, k in KINDS if k in S.SHARED] + [
     ("U_REGISTER", S.USERS["user_register"], S.USER_SIGNATURES["user_register"]),
     ("U_UPDATE", S.USERS["user_update"], S.USER_SIGNATURES["user_update"]),
     ("P_FOLLOW", S.WRITES["follow"], S.SIGNATURES["follow"]),
@@ -40,7 +40,8 @@ CATALOG = [
     ("A_PUT", S.WRITES["article_put"], S.SIGNATURES["article_put"]),
     ("A_DEL", S.WRITES["article_del"], S.SIGNATURES["article_del"]),
 ]
-OIDS = {"bigint": "OID_INT8", "int": "OID_INT4", "text": "OID_TEXT", "text[]": "OID_TEXT_ARRAY", "bigint[]": "OID_INT8_ARRAY"}
+OIDS = {"bigint": "OID_INT8", "int": "OID_INT4", "text": "OID_TEXT", "text[]": "OID_TEXT_ARRAY", "bigint[]": "OID_INT8_ARRAY",
+        "int[]": "OID_INT4_ARRAY"}
 
 
 def c_literal(sql):

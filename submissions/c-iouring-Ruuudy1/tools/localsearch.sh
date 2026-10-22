@@ -20,6 +20,8 @@ LG="${LG:-/tmp/conduit-loadgen}"
 OUT="${OUT:-/root/results/local-search-$LABEL-$(date +%Y%m%d-%H%M)}"
 systemctl stop challenge 2>/dev/null || true
 systemctl reset-failed challenge 2>/dev/null || true
+# a stale server on the port would share it (SO_REUSEPORT) and take part of the load
+if curl -s -o /dev/null --max-time 2 http://127.0.0.1:3110/; then echo "something already answers on port 3110 (a stale server?)"; exit 1; fi
 systemctl set-property --runtime postgresql@18-main.service AllowedCPUs=0-7
 # like box/challenge.service: start.sh in the submission's folder, its HOME, LimitNOFILE=200000; plus the CPU split
 # SERVER_ENV="KEY=VALUE ..." adds settings for experiments (the box sets only the four contract variables)

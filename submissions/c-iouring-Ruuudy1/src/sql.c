@@ -44,6 +44,9 @@ const struct stmt STMTS[S_COUNT] = {
     ENTRY(C_LIST_B, I8, I4, I8, T, TS, TS, I8, T, T, T, IA),
     ENTRY(P_GET_B, I8, T, T, T, B),
     ENTRY(U_GET_B, I8, T, T, T, T),
+    /* item 2: the v2 columns, then the request's position (ord) and its page's ids */
+    ENTRY(LS_GLOBAL, LIST2_COLS, I8, IA), ENTRY(LS_TAG, LIST2_COLS, I8, IA), ENTRY(LS_AUTHOR, LIST2_COLS, I8, IA),
+    ENTRY(LS_FAVORITED, LIST2_COLS, I8, IA),
     ENTRY(U_REGISTER, I8, T, T, T, T),
     ENTRY(U_UPDATE, I8, T, T, T, T),
     ENTRY(P_FOLLOW, T, T, T),

@@ -110,23 +110,25 @@ static void list2_done(struct req *r, struct pgres *res) {
     if (hdr < 0) { resp_error(r, 500, "internal error"); return; }
     uint32_t h = (uint32_t)hdr;
     qsort(arts, na, sizeof arts[0], art_desc);
-    /* favorites counts: (id, count) pairs */
-    struct kv counts[128];
+    /* favorites counts: (id, count) pairs (a shared execution's facts cover every page in it, so any number) */
+    struct kv cbuf[128], *counts = cbuf;
     uint32_t nc = 0;
     struct pgarr ids, cnts;
     if (pv_null(res, h, 13)) {
         /* E7: one article id per favorite on the page, counted here */
         int64_t raw_buf[1024], *raw;
         uint32_t nr = pgarr_i64_sorted(pv_p(res, h, 12), pv_n(res, h, 12), raw_buf, ARRAY_LEN(raw_buf), &raw);
+        if (nr > ARRAY_LEN(cbuf) && !(counts = malloc(sizeof *counts * nr))) die("out of memory");
         for (uint32_t i = 0; i < nr;) {
             uint32_t j = i;
             while (j < nr && raw[j] == raw[i]) j++;
-            if (nc < ARRAY_LEN(counts)) counts[nc++] = (struct kv){raw[i], (int64_t)(j - i)};
+            counts[nc++] = (struct kv){raw[i], (int64_t)(j - i)};
             i = j;
         }
         if (raw != raw_buf) free(raw);
     } else if (pgarr_open(&ids, pv_p(res, h, 12), pv_n(res, h, 12)) && pgarr_open(&cnts, pv_p(res, h, 13), pv_n(res, h, 13))) {
-        for (uint32_t i = 0; i < ids.n && nc < ARRAY_LEN(counts); i++) {
+        if (ids.n > ARRAY_LEN(cbuf) && !(counts = malloc(sizeof *counts * ids.n))) die("out of memory");
+        for (uint32_t i = 0; i < ids.n; i++) {
             const char *a, *b;
             int32_t an, bn;
             if (!pgarr_next(&ids, &a, &an) || !pgarr_next(&cnts, &b, &bn) || an != 8 || bn != 8) break;
@@ -137,16 +139,24 @@ static void list2_done(struct req *r, struct pgres *res) {
     int64_t fav_buf[128], fol_buf[1024], *favs, *fols;
     uint32_t nfav = pgarr_i64_sorted(pv_p(res, h, 14), pv_n(res, h, 14), fav_buf, ARRAY_LEN(fav_buf), &favs);
     uint32_t nfol = pgarr_i64_sorted(pv_p(res, h, 15), pv_n(res, h, 15), fol_buf, ARRAY_LEN(fol_buf), &fols);
-    /* tag (article id, name) pairs, already ordered by name */
+    /* tag (article id, name) pairs, already ordered by name, chained per article of the page in that order */
     struct pgarr aids, names;
     bool have_tags = pgarr_open(&aids, pv_p(res, h, 16), pv_n(res, h, 16)) && pgarr_open(&names, pv_p(res, h, 17), pv_n(res, h, 17));
     uint32_t nt = have_tags ? MIN(aids.n, names.n) : 0;
-    struct { int64_t aid; const char *s; int32_t n; } *tags = nt ? malloc(sizeof *tags * nt) : NULL;
+    struct { const char *s; int32_t n, next; } *tags = nt ? malloc(sizeof *tags * nt) : NULL;
+    int32_t thead[ARRAY_LEN(arts)], ttail[ARRAY_LEN(arts)];
+    for (uint32_t k = 0; k < na; k++) thead[k] = ttail[k] = -1;
     for (uint32_t i = 0; i < nt; i++) {
         const char *a;
         int32_t an;
-        if (!pgarr_next(&aids, &a, &an) || !pgarr_next(&names, &tags[i].s, &tags[i].n) || an != 8) { nt = i; break; }
-        tags[i].aid = (int64_t)rd64(a);
+        if (!pgarr_next(&aids, &a, &an) || !pgarr_next(&names, &tags[i].s, &tags[i].n) || an != 8) break;
+        struct art key = {(int64_t)rd64(a), 0}, *hit = bsearch(&key, arts, na, sizeof arts[0], art_desc);
+        if (!hit) continue; /* another page's article */
+        uint32_t k = (uint32_t)(hit - arts);
+        tags[i].next = -1;
+        if (ttail[k] >= 0) tags[ttail[k]].next = (int32_t)i;
+        else thead[k] = (int32_t)i;
+        ttail[k] = (int32_t)i;
     }
     bool feed = r->kind == K_FEED;
     obuf_t *b = &r->out;
@@ -163,11 +173,8 @@ static void list2_done(struct req *r, struct pgres *res) {
         OB_LIT(b, ",\"description\":");
         put_str(b, pv_str(res, row, 5));
         OB_LIT(b, ",\"tagList\":[");
-        bool firsttag = true;
-        for (uint32_t i = 0; i < nt; i++) {
-            if (tags[i].aid != id) continue;
-            if (!firsttag) ob_ch(b, ',');
-            firsttag = false;
+        for (int32_t i = thead[k]; i >= 0; i = tags[i].next) {
+            if (i != thead[k]) ob_ch(b, ',');
             ob_json_nstr(b, tags[i].s, tags[i].n);
         }
         OB_LIT(b, "],\"createdAt\":");
@@ -188,9 +195,76 @@ static void list2_done(struct req *r, struct pgres *res) {
     ob_i64(b, pv_i64(res, h, 11));
     ob_ch(b, '}');
     free(tags);
+    if (counts != cbuf) free(counts);
     if (favs != fav_buf) free(favs);
     if (fols != fol_buf) free(fols);
     resp_finish(r, 200);
+}
+
+/* ---------- shared lists (item 2) ---------- */
+
+/* A shared execution (statements.py SHARED) has the v2 columns plus 18 ord and 19 page: k = 0 one header row per
+ * request (its count, its viewer's favorites and follows, its page's ids), k = 1 every article on any of the pages,
+ * k = 2 one row of facts (favorites counts, tag names) for all of them. */
+enum { L2_NCOLS = 18, LS_ORD = 18, LS_PAGE = 19, LS_NCOLS = 20 };
+
+static int share_by_id(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+void share_index(struct share_ix *x, const struct pgres *res) {
+    x->n = 0;
+    x->facts = UINT32_MAX;
+    memset(x->hdr, 0xff, sizeof x->hdr);
+    if (res->ncols != LS_NCOLS) return;
+    if (res->nrows > x->cap) {
+        x->cap = res->nrows * 2;
+        if (!(x->a = realloc(x->a, sizeof *x->a * x->cap))) die("out of memory");
+    }
+    for (uint32_t i = 0; i < res->nrows; i++) {
+        int32_t k = pv_i32(res, i, 0);
+        if (k == 1) {
+            x->a[x->n].id = pv_i64(res, i, 1);
+            x->a[x->n++].row = i;
+        } else if (k == 2) {
+            x->facts = i;
+        } else if (k == 0) {
+            int64_t ord = pv_i64(res, i, LS_ORD);
+            if (ord > 0 && ord < (int64_t)ARRAY_LEN(x->hdr)) x->hdr[ord] = i;
+        }
+    }
+    qsort(x->a, x->n, sizeof *x->a, share_by_id);
+}
+
+/* Request ord's own v2 rows: its header with the shared facts, then the articles of its own page. */
+bool share_view(struct share_ix *x, const struct pgres *res, int64_t ord, struct pgres *view) {
+    if (ord <= 0 || ord >= (int64_t)ARRAY_LEN(x->hdr) || x->hdr[ord] == UINT32_MAX || x->facts == UINT32_MAX) return false;
+    uint32_t h = x->hdr[ord];
+    struct pgarr page;
+    if (!pgarr_open(&page, pv_p(res, h, LS_PAGE), pv_n(res, h, LS_PAGE))) return false;
+    uint32_t need = (1 + page.n) * L2_NCOLS;
+    if (need > x->vcap) {
+        x->vcap = need * 2;
+        if (!(x->v = realloc(x->v, sizeof *x->v * x->vcap))) die("out of memory");
+    }
+    memcpy(x->v, pv(res, h, 0), sizeof *x->v * L2_NCOLS);
+    static const uint8_t facts[] = {12, 13, 16, 17};   /* favorites ids and counts, tag article ids and names */
+    for (size_t i = 0; i < ARRAY_LEN(facts); i++) x->v[facts[i]] = *pv(res, x->facts, facts[i]);
+    uint32_t rows = 1;
+    const char *item;
+    int32_t len;
+    while (pgarr_next(&page, &item, &len)) {
+        if (len != 8) return false;
+        int64_t id = (int64_t)rd64(item);
+        const __typeof__(*x->a) *hit = bsearch(&id, x->a, x->n, sizeof *x->a, share_by_id);
+        if (!hit) continue; /* gone between the page and the article read: its own statement would skip it too */
+        memcpy(&x->v[rows++ * L2_NCOLS], pv(res, hit->row, 0), sizeof *x->v * L2_NCOLS);
+    }
+    uint32_t bytes = 0;
+    for (uint32_t i = 0; i < rows * L2_NCOLS; i++) if (x->v[i].len > 0) bytes += (uint32_t)x->v[i].len;
+    *view = (struct pgres){.base = res->base, .v = x->v, .bytes = bytes, .nrows = rows, .ncols = L2_NCOLS};
+    return true;
 }
 
 void api_list(struct req *r, const char *q, uint32_t qn, bool feed) {

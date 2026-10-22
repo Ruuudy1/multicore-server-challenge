@@ -32,6 +32,7 @@ compare() { # name, A label, A args, B label, B args (TAG= appends a suffix to t
 }
 
 GZ="--server cmd --cmd $HERE/bin/conduit-gzip"
+SH() { printf -- "--env TAG_SHARE=%s --env LIST_SHARE=%s --env READ_GATHER=%s" "$1" "$2" "$3"; } # items 1, 2 and 3
 for exp in ${EXPERIMENTS:-e2 e10 e1 e7 e8 e9 loops conns depth batch}; do
   case $exp in
     e2) compare "E2 batched point reads" "e2 off" "--server c" "e2 on" "--server c --env E2_BATCH=1" ;;
@@ -49,5 +50,12 @@ for exp in ${EXPERIMENTS:-e2 e10 e1 e7 e8 e9 loops conns depth batch}; do
       kind="${exp#e1-}" var="LIST_SHAPE_$(echo "${exp#e1-}" | tr '[:lower:]' '[:upper:]')"
       compare "E1 per kind: $kind" "e1 $kind v2" "--server c" "e1 $kind v1" "--server c --env $var=v1" ;;
     e3) compare "E3 one snapshot per read batch" "e3 statement" "--server c" "e3 batch" "--server c --env READ_SNAPSHOT=batch" ;;
+    # items 1-3 (after PR #7): all three against none, items 1 and 2 alone, each on top of the other two
+    share) compare "Items 1-3 shared executions" "share off" "--server c $(SH 0 0 0)" "share on" "--server c $(SH 1 1 64)" ;;
+    tagshare) compare "Item 1 shared tag list" "tags off" "--server c $(SH 0 0 0)" "tags on" "--server c $(SH 1 0 0)" ;;
+    listshare) compare "Item 2 shared lists" "lists off" "--server c $(SH 0 0 0)" "lists on" "--server c $(SH 0 1 0)" ;;
+    gather) compare "Item 3 gathering" "gather off" "--server c $(SH 1 1 0)" "gather on" "--server c $(SH 1 1 64)" ;;
+    tagsg) compare "Item 1 with lists shared and gathered" "tags off g" "--server c $(SH 0 1 64)" "tags on g" "--server c $(SH 1 1 64)" ;;
+    gather256) compare "READ_GATHER 64 or 256" "gather 64" "--server c $(SH 1 1 64)" "gather 256" "--server c $(SH 1 1 256)" ;;
   esac
 done

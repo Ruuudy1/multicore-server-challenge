@@ -46,6 +46,7 @@ struct pgc {
     char *rows; uint32_t rows_len, rows_cap;   /* current job's rows */
     struct pgval *vals; uint32_t nvals, vals_cap;
     struct pgval *gvals; uint32_t gvals_cap;   /* E2: one request's view of a grouped execution */
+    struct share_ix six;                       /* item 2: the current shared list execution, split per request */
     uint32_t nrows; uint16_t ncols;
     char sqlstate[6];
     uint32_t gen;                   /* bumped on reconnect: completions of the old socket are ignored */

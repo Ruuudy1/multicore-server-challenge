@@ -165,15 +165,23 @@ static void enc_job(struct pgc *c, struct req *r) {
     c->slen += (uint32_t)(p - start);
 }
 
-/* E2: one execution of the batched form of the leader's statement; parameter i becomes the array of every member's
- * parameter i (the element types are the single statement's). */
+/* Item 2: the shared statement answering several requests of a v2 list statement of one kind (not the feed), or -1. */
+static int shared_list_of(int s) {
+    static const int bases[] = {S_L2_GLOBAL, S_L2C_GLOBAL, S_L2T_GLOBAL};
+    for (size_t i = 0; i < ARRAY_LEN(bases); i++)
+        if (s >= bases[i] && s < bases[i] + K_FEED) return S_LS_GLOBAL + (s - bases[i]);
+    return -1;
+}
+
+/* E2 and item 2: one execution of the batched form of the leader's statement; parameter i becomes the array of
+ * every member's parameter i (the element types are the single statement's). */
 static int batched_of(int s) {
     switch (s) {
     case S_A_GET: return S_A_GET_B;
     case S_C_LIST: return S_C_LIST_B;
     case S_P_GET: return S_P_GET_B;
     case S_U_GET: return S_U_GET_B;
-    default: return -1;
+    default: return shared_list_of(s);
     }
 }
 
@@ -266,6 +274,65 @@ static void group_reads(struct req **take, int nt) {
     for (int i = 0; i < nt; i++) if (take[i] && (take[i]->flags & RQ_GROUP) && take[i]->gsize == 1) take[i]->flags &= (uint16_t)~RQ_GROUP;
 }
 
+/* Items 1 and 2: requests one execution answers together, by family: every tag list request (0), and the v2 list
+ * requests of one kind (1 + kind). -1: not shared. */
+enum { SHARE_FAMILIES = 1 + K_FEED, GATHER_SCAN = 512 };
+static int share_family(const struct req *r) {
+    if (r->stmt == S_T_LIST) return cfg.tag_share ? 0 : -1;
+    int s = cfg.list_share ? shared_list_of(r->stmt) : -1;
+    return s < 0 ? -1 : 1 + s - S_LS_GLOBAL;
+}
+
+/* Item 3: a batch holding a shareable request also takes the queued requests of the same family from further back
+ * in the FIFO (looking at most GATHER_SCAN deep), so its shared executions answer more requests at once. */
+static int gather(struct loop *l, struct req **take, int nt, int cap) {
+    uint32_t want = 0;
+    for (int i = 0; i < nt; i++) {
+        int f = share_family(take[i]);
+        if (f >= 0) want |= 1u << f;
+    }
+    struct req *prev = NULL, *next;
+    int scanned = 0;
+    for (struct req *r = l->rq_head; r && want && nt < cap && scanned < GATHER_SCAN; r = next, scanned++) {
+        next = r->next;
+        int f = share_family(r);
+        if (f < 0 || !(want >> f & 1) || (r->flags & RQ_ORPHAN)) { prev = r; continue; }
+        if (prev) prev->next = next;
+        else l->rq_head = next;
+        if (l->rq_tail == r) l->rq_tail = prev;
+        l->rq_len--;
+        r->next = NULL;
+        take[nt++] = r;
+    }
+    return nt;
+}
+
+/* Links each family's requests in take[] behind a leader, at most 255 per execution. A list family needs SHARE_MIN
+ * requests (a shared execution of one costs more than the plain statement); tag lists need two. */
+static void share_groups(struct req **take, int nt) {
+    for (int f = 0; f < SHARE_FAMILIES; f++) {
+        int count = 0;
+        for (int i = 0; i < nt; i++) if (take[i] && share_family(take[i]) == f) count++;
+        if (count < (f == 0 ? 2 : cfg.share_min)) continue;
+        struct req *leader = NULL, *last = NULL;
+        for (int i = 0; i < nt; i++) {
+            struct req *r = take[i];
+            if (!r || share_family(r) != f) continue;
+            r->gnext = NULL;
+            if (!leader || leader->gsize == 255) {
+                leader = last = r;
+                r->flags |= RQ_GROUP;
+                r->gsize = 1;
+                continue;
+            }
+            last->gnext = r;
+            last = r;
+            leader->gsize++;
+            take[i] = NULL; /* answered through its leader */
+        }
+    }
+}
+
 static void send_reads(struct loop *l, struct pgc *c) {
     struct batch *b = &c->batches[(c->bhead + c->bcount) % MAX_DEPTH];
     b->n = b->done = 0;
@@ -279,12 +346,15 @@ static void send_reads(struct loop *l, struct pgc *c) {
         take[nt++] = r;
     }
     if (!nt) return;
+    if (cfg.gather && (cfg.tag_share || cfg.list_share)) nt = gather(l, take, nt, MIN(cfg.read_batch + cfg.gather, (int)ARRAY_LEN(take)));
     if (cfg.e2_batch) group_reads(take, nt);
+    if (cfg.tag_share || cfg.list_share) share_groups(take, nt);
     for (int i = 0; i < nt; i++) {
         struct req *r = take[i];
         if (!r) continue;
         if (r->flags & RQ_GROUP) {
-            enc_group(c, r);
+            if (r->stmt == S_T_LIST) enc_job(c, r); /* item 1: the plain statement; every member gets its rows */
+            else enc_group(c, r);
             l->st.grouped += r->gsize;
         } else {
             enc_job(c, r);
@@ -377,13 +447,16 @@ static void commit_append(struct pgc *c, struct req *r) {
 
 static bool retryable(const char *s) { return !strcmp(s, "40P01") || !strcmp(s, "40001"); }
 
-/* E2: answers every request of a grouped execution with a view of only its own rows (ord = its position), minus
- * the ord column, so its usual renderer sees exactly what its own statement would have returned. */
+/* Answers every request of a grouped execution with what its own statement would have returned, so its usual
+ * renderer runs unchanged. E2: only its own rows (ord = its position), minus the ord column. Item 1 (tag lists):
+ * the execution's rows, the same for every member. Item 2 (lists): its own v2 rows rebuilt by share_view. */
 static void dispatch_group(struct pgc *c, struct req *leader, const struct pgres *res, const char *sqlstate) {
+    bool tags = leader->stmt == S_T_LIST, lists = shared_list_of(leader->stmt) >= 0;
     uint16_t nc = STMTS[leader->stmt].ncols;
-    if (!sqlstate && res->nrows && res->ncols != nc + 1) sqlstate = "XX000";
+    if (!sqlstate && !tags && res->nrows && res->ncols != STMTS[batched_of(leader->stmt)].ncols) sqlstate = "XX000";
+    if (lists && !sqlstate) share_index(&c->six, res);
     uint32_t need = res->nrows * nc + 1;
-    if (need > c->gvals_cap) {
+    if (!tags && !lists && need > c->gvals_cap) {
         c->gvals_cap = need * 2;
         c->gvals = realloc(c->gvals, sizeof(struct pgval) * c->gvals_cap);
         if (!c->gvals) die("out of memory");
@@ -394,9 +467,20 @@ static void dispatch_group(struct pgc *c, struct req *leader, const struct pgres
         m->gnext = NULL;
         m->flags &= (uint16_t)~RQ_GROUP;
         if (m->flags & RQ_ORPHAN) { req_free(m); continue; }
+        struct pgres own;
         if (sqlstate) {
-            log_msg("statement %s failed: %s", STMTS[batched_of(m->stmt)].name, sqlstate);
+            log_msg("statement %s failed: %s", STMTS[tags ? m->stmt : batched_of(m->stmt)].name, sqlstate);
             resp_error(m, 500, "internal error");
+        } else if (tags) {
+            own = *res;
+            m->done(m, &own);
+        } else if (lists) {
+            if (share_view(&c->six, res, k, &own)) {
+                m->done(m, &own);
+            } else {
+                log_msg("statement %s: no rows for request %lld", STMTS[batched_of(m->stmt)].name, (long long)k);
+                resp_error(m, 500, "internal error");
+            }
         } else {
             uint32_t rows = 0;
             for (uint32_t i = 0; i < res->nrows; i++) {

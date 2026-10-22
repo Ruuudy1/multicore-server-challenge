@@ -59,6 +59,12 @@ static void load_config(void) {
     }
     cfg.e2_batch = env_int("E2_BATCH", 0, 0, 1);
     cfg.e2_min = env_int("E2_MIN", 2, 2, 1024);
+    /* Items 1-3 (after PR #7): requests queued together share one execution of the tag list and of their list
+     * kind's pages, and a read batch gathers more of them from the FIFO: -23.8% CPU per request (README). */
+    cfg.tag_share = env_int("TAG_SHARE", 1, 0, 1);
+    cfg.list_share = env_int("LIST_SHARE", 1, 0, 1);
+    cfg.share_min = env_int("SHARE_MIN", 2, 1, 255);
+    cfg.gather = env_int("READ_GATHER", 64, 0, 1000);
     cfg.gzip_min = env_int("GZIP_MIN", 0, 0, 1 << 30);
     cfg.gzip_level = env_int("GZIP_LEVEL", 1, 1, 12);
 #ifndef WITH_GZIP
