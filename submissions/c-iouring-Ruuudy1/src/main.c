@@ -27,7 +27,9 @@ static void load_config(void) {
     if (!cfg.database_url || !*cfg.database_url || !cfg.jwt_secret || !*cfg.jwt_secret) die("DATABASE_URL and JWT_SECRET are required");
     cfg.host = getenv("HOST") && *getenv("HOST") ? getenv("HOST") : "127.0.0.1";
     cfg.port = getenv("PORT") && *getenv("PORT") ? getenv("PORT") : "3000";
-    cfg.loops = env_int("LOOPS", 2, 1, 32);
+    /* One loop: with E8 it held 21,000 users against 19,000 for two loops (README); one loop thread is 78% busy at
+     * 37,000 req/s, so it has headroom to about 48,000 req/s. LOOPS=2 for more. */
+    cfg.loops = env_int("LOOPS", 1, 1, 32);
     cfg.pg_read_conns = env_int("PG_READ_CONNS", 8, 1, 94);
     cfg.pg_write_conns = env_int("PG_WRITE_CONNS", 2, 1, 32);
     if (cfg.pg_read_conns < cfg.loops) cfg.pg_read_conns = cfg.loops;
@@ -48,7 +50,7 @@ static void load_config(void) {
     static const char *const shapes[] = {"v1", "v2", "v1d", "v2c", "v2t"}; /* SHAPE_* order */
     for (int k = 0; k < K_KINDS; k++) {
         const char *v = getenv(kinds[k]);
-        cfg.list_shape[k] = SHAPE_V2; /* E1: v2 cut CPU per request 6.1% on an aged database (README) */
+        cfg.list_shape[k] = SHAPE_V2T; /* E1 + E8: v2 lists with tag names by key probes (README) */
         if (!v || !*v) continue;
         int s = -1;
         for (int i = 0; i < (int)ARRAY_LEN(shapes); i++) if (!strcmp(v, shapes[i])) s = i;

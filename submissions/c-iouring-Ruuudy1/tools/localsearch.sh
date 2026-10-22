@@ -22,8 +22,11 @@ systemctl stop challenge 2>/dev/null || true
 systemctl reset-failed challenge 2>/dev/null || true
 systemctl set-property --runtime postgresql@18-main.service AllowedCPUs=0-7
 # like box/challenge.service: start.sh in the submission's folder, its HOME, LimitNOFILE=200000; plus the CPU split
+# SERVER_ENV="KEY=VALUE ..." adds settings for experiments (the box sets only the four contract variables)
+extra=()
+for kv in ${SERVER_ENV:-}; do extra+=("--setenv=$kv"); done
 systemd-run --unit=challenge --property=AllowedCPUs=0-7 --property=LimitNOFILE=200000 --uid="$USER_" \
-  --working-directory="$TARGET" --setenv=HOME="$HOME_" \
+  --working-directory="$TARGET" --setenv=HOME="$HOME_" "${extra[@]}" \
   --setenv=DATABASE_URL="postgres://conduit:conduit@127.0.0.1:5432/$DB" --setenv=JWT_SECRET=multicore-server-challenge \
   --setenv=HOST=127.0.0.1 --setenv=PORT=3110 /bin/bash "$TARGET/start.sh"
 for _ in $(seq 60); do curl -sf -o /dev/null http://127.0.0.1:3110/api/tags && break; sleep 1; done

@@ -19,9 +19,10 @@ tries to cost Postgres as little as possible, then to cost as little as possible
 
 ### Event loops
 
-- `LOOPS` (2) threads, each with its own io_uring (`SINGLE_ISSUER | DEFER_TASKRUN | COOP_TASKRUN`, falling back
-  when the kernel lacks them), its own `SO_REUSEPORT` listener, its own Postgres connections and its own queues.
-  Nothing is shared on the request path.
+- `LOOPS` event-loop threads (1 by default, measured below), each with its own io_uring (`SINGLE_ISSUER |
+  DEFER_TASKRUN | COOP_TASKRUN`, falling back when the kernel lacks them), its own `SO_REUSEPORT` listener, its own
+  Postgres connections and its own queues. Nothing is shared on the request path. One loop thread is 78% busy at
+  37,000 req/s, so it has headroom to about 48,000 req/s; `LOOPS=2` splits the work if a box ever needs more.
 - Multishot accept straight into the ring's registered file table (as large as `RLIMIT_NOFILE`, 200,000 slots per
   ring under the service unit); plain descriptors if registration fails.
 - One multishot receive per connection with buffers from a provided-buffer ring (4,096 x 4 KiB per loop): an idle
@@ -75,10 +76,11 @@ sequential scans of big tables.
 - **No writes to `tags` on the hot path**: an article creation inserts only tag names that don't exist yet.
 - Comments: the article check and the newest 100 comments in one statement; the header row carries the viewer's
   follow set and C computes each comment's `following`.
-- **Lists as page facts (v2, the default):** one header row carries the page's facts, gathered with a few range
-  (global list: every id between the page's min and max is on it) or `= ANY` scans: favorite counts, the viewer's
-  favorites and follows, and tag names. Plain article rows follow, and C joins them. On an aged database this cut
-  CPU per request 6.1% against per-row decoration (v1), which stays available with `LIST_SHAPE_<KIND>=v1`.
+- **Lists as page facts (v2):** one header row carries the page's facts, gathered with a few range (global list:
+  every id between the page's min and max is on it) or `= ANY` scans: favorite counts, the viewer's favorites and
+  follows, and tag names. Plain article rows follow, and C joins them. On an aged database this cut CPU per request
+  6.1% against per-row decoration (v1). The default (`v2t`) looks the tag names up by primary key instead of
+  hash-joining `tags`; the other shapes stay available with `LIST_SHAPE_<KIND>=v1|v2|...`.
 
 ### bcrypt
 
@@ -113,8 +115,11 @@ sequential scans of big tables.
 - `tools/diffcheck.sh`: 3,000 random read requests each on the dev and the full seed (all list filters, deep
   offsets, feeds, articles, comments, profiles, users, bad parameters and tokens) against the Go example on the
   same database: 0 differences.
-- `tools/sqlcheck/check.py` on PostgreSQL 18.6: 1,891 checks and 0 mismatches each on the dev seed and on the
-  edge-case dataset, 791 checks and 0 mismatches on the full seed (40 rounds), 0 plan warnings.
+- `tools/sqlcheck/check.py` on PostgreSQL 18.6, every list shape (v1, v2, v2t, v1d, v2c) and the batched E2
+  statements: 4,949 checks and 0 mismatches each on the dev seed and on the edge-case dataset, 1,699 checks and 0
+  mismatches on the full seed (20 rounds), 0 plan warnings.
+- With the final defaults (one loop, `v2t` lists): conformance 197/197 on the dev and the full seed, transcript
+  identical, edge cases clean, and 0 differences from the Go example in 4,000 reads at 32 concurrent requests.
 - `tests/run.sh`: 490 unit checks (SHA-256 against FIPS vectors with and without SHA-NI, HMAC against RFC 4231,
   PBKDF2 against RFC 7914, base64url, the JSON parser, JWT acceptance and rejection, bcrypt, timestamps, slugify,
   the HTTP parser), also under ASan and UBSan. `tests/edge.sh` (27 checks) covers pipelining, split requests,
@@ -209,6 +214,20 @@ That is short of the build spec's goal of 25 to 35% over the strongest entry, on
 requests per second but with a wider latency spread (p50 299 ms against 410 ms, p99 536 against 508 ms), which
 caps its users. The bar on the real box may differ: PR #8 claims 100k users on a GCP c4-highcpu-8.
 
+That table ran the defaults of the time (v2 lists, two loops). With the final defaults (`v2t` lists, one loop),
+bracketed against the strongest entry in one later session:
+
+| Run | Users held 5 minutes (x0.1) | req/s | p95 | p99 | Errors |
+|---|---|---|---|---|---|
+| this one, final defaults | 20,000 | 26,961 | 452 ms | 475 ms | 0 |
+| PR #7, Rust + Tokio | 18,000 | 27,075 | 462 ms | 516 ms | 0 |
+| this one again | 20,000 | 25,469 | 486 ms | 516 ms | 0 |
+
+**+11.1% over the strongest entry**, the same margin as before on a slower day (this laptop's absolute numbers
+move about 10% between days, so only same-session runs are compared). Still short of the build spec's 25 to 35%:
+the two servers move the same requests per second, and the remaining gap is mostly Postgres work per request, which
+the experiments above have mostly exhausted on this machine.
+
 ### Experiments (section 8 of the build spec)
 
 `tools/campaign.sh` runs each comparison as two ABBA cycles (4 paired runs of each variant) at 9,000 users, on one
@@ -223,10 +242,10 @@ excludes zero and p99 does not regress by more than 10%. All runs on AC power wi
 | E1 | v2 lists, all kinds | **-6.1%** [-9.2, -3.0] | -40% / -35% | **adopted**: v2 is the default |
 | E2 | point reads grouped per statement (`E2_BATCH=1`) | +1.7% [-0.5, +3.9] | +7% / +11% | rejected |
 | E7 | v2 favorite counts as raw ids counted in C (`v2c`) | -1.4% [-4.0, +0.7] | -8% / -1% | rejected |
-| E8 | v2 tag names by key probes (`v2t`) | -1.8% [-3.3, -0.3] | -20% / -19% | below the bar; first to retry on the box |
+| E8 | v2 tag names by key probes (`v2t`) | -1.8% [-3.3, -0.3] | -20% / -19% | **adopted on the score** (below) |
 | E9 | gzip of bodies over 4 KB (`GZIP=1` build) | +4.7% [+2.5, +7.7] | +21% / +18% | rejected (on loopback) |
 | E10 | v1 with one `users` look-up per author (`v1d`) | +1.7% [-0.8, +5.1] | | rejected |
-| E5 | `LOOPS` 2 → 1 | -2.4% [-4.9, +0.2] | -16% / -16% | below the bar; retry on the box |
+| E5 | `LOOPS` 2 → 1 | -2.4% [-4.9, +0.2] | -16% / -16% | **adopted on the score** (below) |
 | E5 | `PG_READ_CONNS` 8 → 12 | +6.5% [-0.1, +16.1] | +54% / +67% | rejected |
 | E5 | `PG_DEPTH` 2 → 4 | -2.7% [-9.2, +3.2] | -3% / +1% | inconclusive; 2 stays |
 | E5 | `READ_BATCH` 24 → 12 | +2.1% [-0.3, +4.9] | +5% / +5% | rejected |
@@ -258,6 +277,25 @@ Notes:
   request, but 4 ABBA pairs (`tools/abba.py`) put the change at -0.0%, 95% interval [-2.6%, +2.6%]: the single
   runs had ridden a drift of the machine itself (CPU per request fell from 302 to 252 µs over 25 minutes, whatever
   the setting). 250 µs stays.
+- **E8, one loop and bcrypt nice, judged by the score.** The CPU rule left E8 and one loop just under the bar
+  although both cut tail latency by 16 to 20%, and the score is set by p95 at the limit, not by CPU. So they ran
+  as full searches (`tools/compare.sh`), each from a fresh copy of the full seed, against the defaults of the time
+  (v2 lists, two loops) in the same session, with Windows Search paused:
+
+  | Run | Users held 5 minutes (x0.1) | req/s | p95 |
+  |---|---|---|---|
+  | defaults (v2, two loops) | 19,000 | 25,543 | 458 ms |
+  | E8 (`v2t`) | 20,000 | 26,038 | 486 ms |
+  | one loop | 20,000 | 25,524 | 469 ms |
+  | bcrypt at nice 10 | 19,000 | 25,140 | 464 ms |
+  | defaults again | 19,000 | 25,484 | 453 ms |
+  | **E8 + one loop** | **21,000** | **27,170** | **468 ms** |
+  | defaults a third time | 19,000 | 25,642 | 453 ms |
+
+  The defaults held 19,000 three times, so the session was stable; E8 and one loop each gained a step (+5.3%) and
+  together two (+10.5%), so both are the defaults now. Nice 10 changed nothing (nice 5 stays). The same defaults
+  held 21,000 on another day: absolute numbers move about 10% between days on this laptop, so only runs from one
+  session are compared.
 - **Correctness of the variants:** every one keeps the conformance transcript identical to the reference's,
   `check.py` finds 0 mismatches in 4,949 checks, and E2 and E9 pass the differential test under 32 to 96 concurrent
   requests (E2 also under ASan and UBSan), so each stays switchable for A/B work on the box.
@@ -280,7 +318,7 @@ the variables exist for local sweeps.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LOOPS` | 2 | event-loop threads |
+| `LOOPS` | 1 | event-loop threads |
 | `PG_READ_CONNS` | 8 | read connections in total, split over the loops |
 | `PG_WRITE_CONNS` | 2 | write connections in total |
 | `PG_DEPTH` | 2 | batches in flight per read connection |
@@ -293,7 +331,7 @@ the variables exist for local sweeps.
 | `BCRYPT_LANES` | auto | hashes in lockstep (calibrated at startup) |
 | `BCRYPT_WAIT_MS` | 250 | how long a job may wait for its batch to fill |
 | `BCRYPT_NICE` | 5 | nice level of the bcrypt workers |
-| `LIST_SHAPE_GLOBAL`, `_TAG`, `_AUTHOR`, `_FAVORITED`, `_FEED` | v2 | list SQL shape: v1, v2, v1d (E10), v2c (E7), v2t (E8) |
+| `LIST_SHAPE_GLOBAL`, `_TAG`, `_AUTHOR`, `_FAVORITED`, `_FEED` | v2t | list SQL shape: v1, v2, v1d (E10), v2c (E7), v2t (E8) |
 | `E2_BATCH`, `E2_MIN` | 0, 2 | E2: group concurrent point reads of one statement (at least `E2_MIN` of them) |
 | `READ_SNAPSHOT` | statement | `batch`: repeatable read on read connections (E3) |
 | `GZIP_MIN`, `GZIP_LEVEL` | 0, 1 | E9: gzip bodies of at least this many bytes (only in a `GZIP=1` build) |
